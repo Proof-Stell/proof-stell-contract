@@ -2,7 +2,74 @@
 
 # ProofStell Smart Contract
 
-Decentralized Document Verification Contract built with Soroban.
+Decentralized Document 📄 Verification Contract built with Soroban.
+
+ProofStell is a decentralized platform built on Soroban smart contracts that allows institutions, organizations, and individuals to issue, verify, and manage tamper-proof digital credentials and documents.
+
+Instead of trusting centralized databases, ProofDesk anchors cryptographic proofs of documents on-chain, ensuring authenticity, permanence, and global verifiability.
+
+From academic certificates to employment records and compliance documents, ProofDesk creates a trustless verification infrastructure powered by Stellar
+User interface for the ProofStell decentralized document verification platform.
+
+🚀 Key Features
+📄 On-Chain Document Proofs
+
+Institutions can register documents by storing cryptographic hashes on-chain via Soroban smart contracts.
+
+Anyone can verify a document’s authenticity by comparing its hash with the blockchain record.
+
+🏫 Institutional Issuers
+
+Verified institutions (schools, companies, NGOs) can issue credentials directly to users’ wallets.
+
+Examples:
+
+University certificates
+
+Employment letters
+
+Training certifications
+
+Compliance approvals
+
+🔐 Wallet-Based Identity
+
+Users connect their Stellar wallets to:
+
+Receive credentials
+
+Share verifiable proofs
+
+Manage issued documents
+
+No usernames or passwords required.
+
+🔎 Instant Verification
+
+Third parties can verify documents in seconds:
+
+Upload the document
+
+Platform hashes the file
+
+Hash is matched with the blockchain record
+
+Result: Valid / Not Found / Revoked
+
+🧾 Revocation Registry
+
+Issuers can revoke credentials if necessary.
+
+Example cases:
+
+Fraudulent certificates
+
+Expired compliance documents
+
+Recalled licenses
+
+The revocation state is stored on-chain for full transparency.
+
 
 This contract powers the on-chain verification layer of the ProofStell platform, allowing institutions and individuals to register and verify document authenticity on the Stellar blockchain.
 
