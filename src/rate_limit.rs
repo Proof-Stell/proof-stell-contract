@@ -84,6 +84,7 @@ struct IssuerEntry {
     /// Approximate remaining tokens (maintained as a best-effort counter).
     remaining: u32,
     /// Configured burst capacity for this issuer (used for reset estimation).
+    #[allow(dead_code)]
     burst: u32,
     /// Seconds per full refill (≈ burst / per_second).
     refill_period_secs: u64,
