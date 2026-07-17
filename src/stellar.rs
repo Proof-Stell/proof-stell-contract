@@ -11,7 +11,9 @@ use std::{
 };
 use thiserror::Error;
 
-use crate::{cache::CacheKey, config::AppConfig, rate_limit::StellarRateLimiter};
+use crate::{
+    cache::CacheKey, config::AppConfig, hash_validator::CanonicalHash,
+};
 
 use crate::metrics::MetricsRegistry;
 
@@ -26,7 +28,6 @@ const DEFAULT_HALF_OPEN_MAX_CALLS: u32 = 1;
 pub struct StellarClient {
     horizon_url: String,
     http_client: reqwest::Client,
-    rate_limiter: Arc<StellarRateLimiter>,
     circuit_breaker: Arc<CircuitBreaker>,
     max_retries: u32,
     metrics: Option<Arc<MetricsRegistry>>,
@@ -162,23 +163,6 @@ pub struct VerificationResult {
     pub last_http_status: Option<u16>,
 }
 
-#[derive(Debug, Deserialize)]
-struct HorizonTransactionsResponse {
-    #[serde(rename = "_embedded")]
-    embedded: HorizonEmbeddedRecords,
-}
-
-#[derive(Debug, Deserialize)]
-struct HorizonEmbeddedRecords {
-    records: Vec<HorizonTransactionRecord>,
-}
-
-#[derive(Debug, Deserialize)]
-struct HorizonTransactionRecord {
-    hash: Option<String>,
-    created_at: Option<String>,
-}
-
 pub type StellarResult<T> = Result<T, StellarError>;
 
 impl VerificationResult {
@@ -220,10 +204,6 @@ impl StellarClient {
         Self {
             horizon_url: trim_trailing_slash(horizon_url),
             http_client,
-            rate_limiter: Arc::new(StellarRateLimiter::new(
-                config.rate_limit_per_second,
-                config.rate_limit_burst,
-            )),
             circuit_breaker: Arc::new(CircuitBreaker::new(config.circuit_breaker.clone())),
             max_retries: config.retry.max_retries,
             metrics: None,
@@ -367,6 +347,23 @@ impl StellarClient {
     ///
     /// Records latency, success/failure, and retry metrics.
     pub async fn verify_hash(&self, hash: &str) -> VerificationResult {
+        // Enforce canonicalization at the API/service boundary. This rejects
+        // non-canonical input (uppercase, whitespace, wrong algorithm/length)
+        // before any network call, guaranteeing every downstream consumer
+        // operates on a validated, canonical SHA-256 hash.
+        let canonical = match CanonicalHash::new(hash) {
+            Ok(c) => c,
+            Err(_) => {
+                return VerificationResult {
+                    status: VerificationStatus::MalformedResponse,
+                    transaction_id: None,
+                    timestamp: None,
+                    last_http_status: None,
+                };
+            }
+        };
+        let hash = canonical.as_str();
+
         let overall_start = MetricsRegistry::start_timer();
         let mut last_status = VerificationStatus::NoMatch;
         let mut last_http_status: Option<u16> = None;
@@ -490,13 +487,24 @@ impl StellarClient {
             // Cross-check: the transaction's memo must match the expected hash.
             // Horizon filters by memo on the server side, but we verify
             // client-side for defense in depth.
-            // Only "text" memos are relevant — skip "hash", "return", etc.
-            let memo_matches = tx.memo_type.as_deref() == Some("text")
-                && tx
-                    .memo
+            //
+            // A document hash is recorded as either a `text` memo (the hex
+            // string itself) or a `hash` memo (base64 of the decoded 32 bytes).
+            // `expected_hash` is already canonical (lowercase), so the
+            // comparison is a direct, allocation-free string equality.
+            let memo = tx.memo.as_deref().unwrap_or("");
+            let expected_hash_b64 = crate::hash_validator::CanonicalHash::new(expected_hash)
+                .ok()
+                .and_then(|c| c.to_stellar_memo_base64().ok());
+
+            let memo_matches = match tx.memo_type.as_deref() {
+                Some("text") => memo.eq_ignore_ascii_case(expected_hash),
+                Some("hash") => expected_hash_b64
                     .as_deref()
-                    .map(|m| m.to_lowercase() == expected_hash.to_lowercase())
-                    .unwrap_or(false);
+                    .map(|b64| b64 == memo)
+                    .unwrap_or(false),
+                _ => false,
+            };
 
             if memo_matches {
                 let timestamp = tx
@@ -816,15 +824,6 @@ fn is_retryable_status(status: u16) -> bool {
     status == 408 || status == 429 || (500..=599).contains(&status)
 }
 
-fn truncate_body(body: &str) -> String {
-    const MAX_BODY_CHARS: usize = 512;
-    if body.chars().count() <= MAX_BODY_CHARS {
-        body.to_string()
-    } else {
-        format!("{}...", body.chars().take(MAX_BODY_CHARS).collect::<String>())
-    }
-}
-
 fn jittered_delay(max_delay: Duration) -> Duration {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -833,12 +832,6 @@ fn jittered_delay(max_delay: Duration) -> Duration {
     let fraction = nanos as f64 / 1_000_000_000.0;
     let millis = (max_delay.as_secs_f64() * 1000.0 * fraction).round() as u64;
     Duration::from_millis(millis)
-}
-
-fn parse_horizon_timestamp(value: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(value)
-        .ok()
-        .map(|timestamp| timestamp.timestamp())
 }
 
 async fn sleep(delay: Duration) {
@@ -881,7 +874,7 @@ mod tests {
                 "records": [
                     {
                         "id": "transaction-id",
-                        "memo": "document-hash",
+                        "memo": CANONICAL_TEST_HASH,
                         "memo_type": "text",
                         "created_at": "2024-01-01T00:00:00Z"
                     }
@@ -890,10 +883,15 @@ mod tests {
         })
     }
 
+    /// Canonical SHA-256 hex string used by retry/circuit-breaker tests. Must be
+    /// valid lowercase hex so it passes the boundary canonicalization check.
+    const CANONICAL_TEST_HASH: &str =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
     #[tokio::test]
     async fn verify_hash_with_retry_succeeds_after_transient_failures() {
         let server = MockServer::start().await;
-        let hash = "document-hash";
+        let hash = CANONICAL_TEST_HASH;
 
         Mock::given(method("GET"))
             .and(path("/transactions"))
@@ -923,7 +921,7 @@ mod tests {
     #[tokio::test]
     async fn verify_hash_with_retry_reports_attempts_and_final_error() {
         let server = MockServer::start().await;
-        let hash = "document-hash";
+        let hash = CANONICAL_TEST_HASH;
         let mut config = test_config();
         config.retry.max_retries = 1;
         config.circuit_breaker.failure_threshold = 1;
@@ -960,7 +958,7 @@ mod tests {
     #[tokio::test]
     async fn circuit_breaker_rejects_calls_while_open() {
         let server = MockServer::start().await;
-        let hash = "document-hash";
+        let hash = CANONICAL_TEST_HASH;
         let mut config = test_config();
         config.retry.max_retries = 0;
         config.circuit_breaker.failure_threshold = 1;
@@ -995,7 +993,7 @@ mod tests {
     #[tokio::test]
     async fn circuit_breaker_recovers_from_half_open_success() {
         let server = MockServer::start().await;
-        let hash = "document-hash";
+        let hash = CANONICAL_TEST_HASH;
         let mut config = test_config();
         config.retry.max_retries = 0;
         config.circuit_breaker.failure_threshold = 1;
@@ -1047,8 +1045,6 @@ mod tests {
         assert_eq!(client.retry_delay(1), Duration::from_millis(200));
         assert_eq!(client.retry_delay(2), Duration::from_millis(400));
     }
-
-    use super::*;
 
     #[test]
     fn client_accepts_optional_metrics() {
