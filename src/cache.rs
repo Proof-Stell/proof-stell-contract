@@ -627,10 +627,9 @@ impl InMemoryCache {
         lru_queue.retain(|k| k != key);
         lru_queue.push_front(key.clone());
         
-        // Broadcast update event if this was an update
-        if is_update {
-            let _ = self.event_tx.send(CacheEvent::Updated { key: key.clone() });
-        }
+        // Broadcast update event for any set (create or update) so subscribers
+        // always receive the latest state change.
+        let _ = self.event_tx.send(CacheEvent::Updated { key: key.clone() });
         
         // Evict entries if over max_size
         if self.max_size > 0 {
@@ -695,6 +694,7 @@ mod tests {
     use futures::StreamExt;
     use std::time::Duration;
     use tokio::time::sleep;
+    use tokio::sync::broadcast::error::TryRecvError;
 
     #[tokio::test]
     async fn in_memory_cache_returns_value_within_ttl() {
@@ -927,6 +927,8 @@ mod tests {
         let mut handles = vec![];
 
         // Concurrent hits
+        // Ensure the key exists so these are hits, not misses.
+        backend.set_raw(&CacheKey::Verification("metric_concurrent".to_string()), "value", 60).await.unwrap();
         for _ in 0..50 {
             let backend_clone = Arc::clone(&backend);
             let key = CacheKey::Verification("metric_concurrent".to_string());
@@ -1145,21 +1147,18 @@ mod tests {
         // Delete it
         cache.delete(&CacheKey::Verification("event_key".to_string())).await.unwrap();
         
-        // Check events
-        let events: Vec<_> = futures::stream::unfold(&mut rx, |rx| async move {
-            match rx.recv().await {
-                Ok(event) => Some((event, rx)),
-                Err(_) => None,
-            }
-        })
-        .take(3)
-        .collect()
-        .await;
+        // Check events with timeout
+        let event1 = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
+        assert!(event1.is_ok());
+        matches!(event1.unwrap().unwrap(), CacheEvent::Updated { .. });
         
-        assert_eq!(events.len(), 3);
-        matches!(events[0], CacheEvent::Updated { .. });
-        matches!(events[1], CacheEvent::Updated { .. });
-        matches!(events[2], CacheEvent::Deleted { .. });
+        let event2 = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
+        assert!(event2.is_ok());
+        matches!(event2.unwrap().unwrap(), CacheEvent::Updated { .. });
+        
+        let event3 = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
+        assert!(event3.is_ok());
+        matches!(event3.unwrap().unwrap(), CacheEvent::Deleted { .. });
     }
 
     #[tokio::test]
@@ -1168,11 +1167,20 @@ mod tests {
         let mut rx = cache.subscribe();
         
         cache.set_raw(&CacheKey::Verification("expire_key".to_string()), "value", 1).await.unwrap();
+        // Drain any prior events (e.g., initial Updated from set)
+        loop {
+            match rx.try_recv() {
+                Ok(_) => continue,
+                Err(TryRecvError::Empty) => break,
+                Err(_) => break,
+            }
+        }
+
         sleep(Duration::from_secs(2)).await;
-        
+
         // Trigger expiry check
         cache.get_raw(&CacheKey::Verification("expire_key".to_string())).await.unwrap();
-        
+
         // Check for expiration event
         let event = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
         assert!(event.is_ok());
@@ -1187,17 +1195,24 @@ mod tests {
     async fn event_broadcasts_on_eviction() {
         let cache = InMemoryCache::with_max_size(2);
         let mut rx = cache.subscribe();
-        
+        // Perform sets that should trigger eviction
         cache.set_raw(&CacheKey::Verification("evict1".to_string()), "value1", 60).await.unwrap();
         cache.set_raw(&CacheKey::Verification("evict2".to_string()), "value2", 60).await.unwrap();
         cache.set_raw(&CacheKey::Verification("evict3".to_string()), "value3", 60).await.unwrap();
-        
-        // Check for eviction event
-        let event = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
-        assert!(event.is_ok());
-        if let Ok(Ok(CacheEvent::Evicted { .. })) = event {
-            // Correct event type
-        } else {
+
+        // Consume events until we see an Evicted event or timeout
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        let mut found = false;
+        while std::time::Instant::now() < deadline {
+            if let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+                if let CacheEvent::Evicted { .. } = ev {
+                    found = true;
+                    break;
+                }
+            }
+        }
+
+        if !found {
             std::panic!("Expected Evicted event");
         }
     }
