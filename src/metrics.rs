@@ -22,6 +22,9 @@ pub struct MetricsRegistry {
     cache_misses: IntCounter,
     cache_expired: IntCounter,
     cache_serialization_failures: IntCounter,
+    cache_size: Gauge,
+    cache_evictions: IntCounter,
+    cache_hit_rate: Gauge,
 
     // ── Document registration metrics ──
     document_registration_total: IntCounterVec,
@@ -89,6 +92,9 @@ impl MetricsRegistry {
             "Total cache serialization/deserialization failures",
         )
         .unwrap();
+        let cache_size = Gauge::new("cache_size", "Current number of entries in cache").unwrap();
+        let cache_evictions = IntCounter::new("cache_evictions_total", "Total cache evictions").unwrap();
+        let cache_hit_rate = Gauge::new("cache_hit_rate", "Current cache hit rate (0-1)").unwrap();
 
         // ── Document metrics ──
         let document_registration_total = IntCounterVec::new(
@@ -244,6 +250,9 @@ impl MetricsRegistry {
             Box::new(cache_misses.clone()),
             Box::new(cache_expired.clone()),
             Box::new(cache_serialization_failures.clone()),
+            Box::new(cache_size.clone()),
+            Box::new(cache_evictions.clone()),
+            Box::new(cache_hit_rate.clone()),
             Box::new(document_registration_total.clone()),
             Box::new(document_revocation_total.clone()),
             Box::new(verification_total.clone()),
@@ -275,6 +284,9 @@ impl MetricsRegistry {
             cache_misses,
             cache_expired,
             cache_serialization_failures,
+            cache_size,
+            cache_evictions,
+            cache_hit_rate,
             document_registration_total,
             document_revocation_total,
             verification_total,
@@ -328,6 +340,22 @@ impl MetricsRegistry {
 
     pub fn increment_cache_serialization_failures(&self) {
         self.cache_serialization_failures.inc();
+    }
+
+    pub fn set_cache_size(&self, size: u64) {
+        self.cache_size.set(size as f64);
+    }
+
+    pub fn increment_cache_evictions(&self) {
+        self.cache_evictions.inc();
+    }
+
+    pub fn increment_cache_evictions_by(&self, count: u64) {
+        self.cache_evictions.inc_by(count);
+    }
+
+    pub fn set_cache_hit_rate(&self, rate: f64) {
+        self.cache_hit_rate.set(rate);
     }
 
     // ── Document metrics ─────────────────────────────────────────────────

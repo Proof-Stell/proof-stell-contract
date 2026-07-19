@@ -57,6 +57,12 @@ pub struct AppConfig {
     pub webhook_request_timeout_ms: u64,
     pub webhook_jitter_enabled: bool,
     pub cache_verification_ttl: u64,
+
+    // ── Cache configuration ─────────────────────────────────────────────
+    pub cache_backend: String,
+    pub cache_max_size: usize,
+    pub cache_config_ttl: u64,
+    pub cache_events_ttl: u64,
 }
 
 impl fmt::Debug for AppConfig {
@@ -109,6 +115,10 @@ impl fmt::Debug for AppConfig {
             .field("webhook_request_timeout_ms", &self.webhook_request_timeout_ms)
             .field("webhook_jitter_enabled", &self.webhook_jitter_enabled)
             .field("cache_verification_ttl", &self.cache_verification_ttl)
+            .field("cache_backend", &self.cache_backend)
+            .field("cache_max_size", &self.cache_max_size)
+            .field("cache_config_ttl", &self.cache_config_ttl)
+            .field("cache_events_ttl", &self.cache_events_ttl)
             .finish()
     }
 }
@@ -216,6 +226,10 @@ impl AppConfig {
             &DEFAULT_STELLAR_CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS.to_string(),
         );
         let cache_verification_ttl_raw = get_env_or_default("CACHE_VERIFICATION_TTL", "3600");
+        let cache_backend_raw = get_env_or_default("CACHE_BACKEND", "inmemory");
+        let cache_max_size_raw = get_env_or_default("CACHE_MAX_SIZE", "10000");
+        let cache_config_ttl_raw = get_env_or_default("CACHE_CONFIG_TTL", "3600");
+        let cache_events_ttl_raw = get_env_or_default("CACHE_EVENTS_TTL", "1800");
 
         let port: u16 = match port_raw.parse() {
             Ok(p) if p > 0 => p,
@@ -462,6 +476,51 @@ impl AppConfig {
             }
         };
 
+        let cache_backend = match cache_backend_raw.to_lowercase().as_str() {
+            "redis" | "rediss" => "redis".to_string(),
+            "inmemory" | "memory" => "inmemory".to_string(),
+            other => {
+                errors.push(format!(
+                    "CACHE_BACKEND must be 'redis' or 'inmemory', got '{}'",
+                    other
+                ));
+                "inmemory".to_string()
+            }
+        };
+
+        let cache_max_size: usize = match cache_max_size_raw.parse() {
+            Ok(v) => v,
+            Err(_) => {
+                errors.push(format!(
+                    "CACHE_MAX_SIZE must be a valid usize, got '{}'",
+                    cache_max_size_raw
+                ));
+                10000
+            }
+        };
+
+        let cache_config_ttl: u64 = match cache_config_ttl_raw.parse() {
+            Ok(v) => v,
+            Err(_) => {
+                errors.push(format!(
+                    "CACHE_CONFIG_TTL must be a valid u64, got '{}'",
+                    cache_config_ttl_raw
+                ));
+                3600
+            }
+        };
+
+        let cache_events_ttl: u64 = match cache_events_ttl_raw.parse() {
+            Ok(v) => v,
+            Err(_) => {
+                errors.push(format!(
+                    "CACHE_EVENTS_TTL must be a valid u64, got '{}'",
+                    cache_events_ttl_raw
+                ));
+                1800
+            }
+        };
+
         match Url::parse(&redis_url) {
             Ok(url) if matches!(url.scheme(), "redis" | "rediss") => {}
             Ok(_) | Err(_) => {
@@ -610,6 +669,10 @@ impl AppConfig {
             webhook_request_timeout_ms,
             webhook_jitter_enabled,
             cache_verification_ttl,
+            cache_backend,
+            cache_max_size,
+            cache_config_ttl,
+            cache_events_ttl,
         })
     }
 }
@@ -649,6 +712,10 @@ mod tests {
             "WEBHOOK_REQUEST_TIMEOUT_MS",
             "WEBHOOK_JITTER_ENABLED",
             "CACHE_VERIFICATION_TTL",
+            "CACHE_BACKEND",
+            "CACHE_MAX_SIZE",
+            "CACHE_CONFIG_TTL",
+            "CACHE_EVENTS_TTL",
         ];
         for key in keys {
             env::remove_var(key);
@@ -831,6 +898,10 @@ mod tests {
             webhook_request_timeout_ms: 10_000,
             webhook_jitter_enabled: true,
             cache_verification_ttl: 3600,
+            cache_backend: "inmemory".to_string(),
+            cache_max_size: 10000,
+            cache_config_ttl: 3600,
+            cache_events_ttl: 1800,
         };
 
         let debug = format!("{:?}", config);

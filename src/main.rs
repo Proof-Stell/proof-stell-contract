@@ -42,6 +42,7 @@ mod native {
     use axum::{Json, Router};
     use serde_json::json;
 
+    use proofstell_contract::cache::{CacheBackend, InMemoryCache};
     use proofstell_contract::config::AppConfig;
     use proofstell_contract::metrics::MetricsRegistry;
     use proofstell_contract::webhook::WebhookDispatcher;
@@ -51,6 +52,7 @@ mod native {
     struct AppState {
         metrics: Arc<MetricsRegistry>,
         webhook: Arc<WebhookDispatcher>,
+        cache: Arc<CacheBackend>,
     }
 
     /// Build the axum router with all application routes.
@@ -60,6 +62,7 @@ mod native {
             .route("/metrics", get(metrics_handler))
             .route("/webhooks/dlq", get(dlq_status_handler))
             .route("/webhooks/dlq/drain", post(dlq_drain_handler))
+            .route("/cache/stats", get(cache_stats_handler))
             .with_state(state)
     }
 
@@ -83,6 +86,35 @@ mod native {
     async fn dlq_drain_handler(State(state): State<AppState>) -> impl IntoResponse {
         let entries = state.webhook.drain_dlq().await;
         Json(json!({ "drained": entries.len(), "entries": entries }))
+    }
+
+    /// `GET /cache/stats` — returns cache statistics.
+    async fn cache_stats_handler(State(state): State<AppState>) -> impl IntoResponse {
+        match &*state.cache {
+            CacheBackend::InMemory(cache) => {
+                let stats = cache.stats().await;
+                Json(json!(
+                    {
+                        "backend": "inmemory",
+                        "hits": stats.hits,
+                        "misses": stats.misses,
+                        "evictions": stats.evictions,
+                        "expired": stats.expired,
+                        "hit_rate": stats.hit_rate,
+                        "current_size": stats.current_size,
+                        "max_size": stats.max_size
+                    }
+                ))
+            }
+            CacheBackend::Redis(_) => {
+                Json(json!(
+                    {
+                        "backend": "redis",
+                        "message": "Redis cache statistics not yet implemented"
+                    }
+                ))
+            }
+        }
     }
 
     /// Bootstrap: load config, wire up services, and start the server.
@@ -110,6 +142,38 @@ mod native {
             config.webhook_urls.len(),
             config.webhook_max_retries,
         );
+        eprintln!(
+            "[proofstell]   cache:              backend={}, max_size={}",
+            config.cache_backend,
+            config.cache_max_size
+        );
+
+        // ── Cache initialization ───────────────────────────────────────
+        let cache: Arc<CacheBackend> = match config.cache_backend.as_str() {
+            "redis" => {
+                eprintln!("[proofstell] Initializing Redis cache backend...");
+                match proofstell_contract::cache::RedisCache::new(&config.redis_url).await {
+                    Ok(redis_cache) => {
+                        let cache = redis_cache.with_metrics(Arc::clone(&metrics));
+                        Arc::new(CacheBackend::Redis(cache))
+                    }
+                    Err(e) => {
+                        eprintln!("[proofstell] Failed to initialize Redis cache: {}, falling back to InMemory", e);
+                        let cache = InMemoryCache::with_max_size(config.cache_max_size)
+                            .with_metrics(Arc::clone(&metrics));
+                        Arc::new(CacheBackend::InMemory(cache))
+                    }
+                }
+            }
+            _ => {
+                eprintln!("[proofstell] Initializing InMemory cache backend (max_size={})", config.cache_max_size);
+                let cache = InMemoryCache::with_max_size(config.cache_max_size)
+                    .with_metrics(Arc::clone(&metrics));
+                Arc::new(CacheBackend::InMemory(cache))
+            }
+        };
+
+        eprintln!("[proofstell] Cache initialized successfully");
 
         // ── Webhook dispatcher ───────────────────────────────────────
         let webhook = Arc::new(WebhookDispatcher::from_app_config(
@@ -121,6 +185,7 @@ mod native {
         let state = AppState {
             metrics: Arc::clone(&metrics),
             webhook,
+            cache,
         };
         let app = build_router(state);
 

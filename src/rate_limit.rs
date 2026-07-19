@@ -6,7 +6,7 @@ use governor::{
 };
 use std::{num::NonZeroU32, string::{String, ToString}, sync::Arc, time::Duration};
 
-use crate::metrics::MetricsRegistry;
+use crate::{cache::CacheKey, metrics::MetricsRegistry};
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -78,6 +78,7 @@ impl Default for RateLimitConfig {
 // ── Per-issuer entry ──────────────────────────────────────────────────────────
 
 /// Metadata tracked per issuer alongside the shared keyed limiter.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct IssuerEntry {
     /// Last time a request was seen from this issuer (Unix seconds).
     last_seen: u64,
@@ -121,6 +122,7 @@ pub struct PerIssuerRateLimiter {
     issuer_meta: Arc<DashMap<String, IssuerEntry>>,
     config: RateLimitConfig,
     metrics: Option<Arc<MetricsRegistry>>,
+    cache: Option<Arc<crate::cache::CacheBackend>>,
 }
 
 impl PerIssuerRateLimiter {
@@ -142,6 +144,7 @@ impl PerIssuerRateLimiter {
             issuer_meta: Arc::new(DashMap::new()),
             config,
             metrics,
+            cache: None,
         }
     }
 
@@ -150,14 +153,21 @@ impl PerIssuerRateLimiter {
         cfg: &crate::config::AppConfig,
         metrics: Option<Arc<MetricsRegistry>>,
     ) -> Self {
-        let rl_cfg = RateLimitConfig {
-            global_per_second: cfg.rate_limit_per_second,
-            global_burst: cfg.rate_limit_burst,
-            per_issuer_per_second: cfg.per_issuer_rate_limit_per_second,
-            per_issuer_burst: cfg.per_issuer_rate_limit_burst,
-            issuer_ttl_seconds: cfg.issuer_rate_limit_ttl_seconds,
-        };
-        Self::new(rl_cfg, metrics)
+        Self::new(
+            RateLimitConfig {
+                global_per_second: cfg.rate_limit_per_second,
+                global_burst: cfg.rate_limit_burst,
+                per_issuer_per_second: cfg.per_issuer_rate_limit_per_second,
+                per_issuer_burst: cfg.per_issuer_rate_limit_burst,
+                issuer_ttl_seconds: cfg.issuer_rate_limit_ttl_seconds,
+            },
+            metrics,
+        )
+    }
+
+    pub fn with_cache(mut self, cache: Arc<crate::cache::CacheBackend>) -> Self {
+        self.cache = Some(cache);
+        self
     }
 
     // ── Public API ────────────────────────────────────────────────────────
@@ -259,6 +269,16 @@ impl PerIssuerRateLimiter {
                 entry.remaining = entry.remaining.saturating_sub(1);
                 entry
             });
+
+        // Persist issuer metadata to cache if available
+        if let Some(cache) = &self.cache {
+            if let Some(entry) = self.issuer_meta.get(issuer) {
+                let cache_key = CacheKey::Config(format!("rate_limit:{}", issuer));
+                if let Ok(serialized) = serde_json::to_string(&*entry) {
+                    let _ = cache.set_raw(&cache_key, &serialized, self.config.issuer_ttl_seconds);
+                }
+            }
+        }
     }
 
     fn global_clock(&self) -> governor::clock::QuantaInstant {

@@ -1824,6 +1824,7 @@ dependencies = [
  "base64",
  "chrono",
  "dashmap",
+ "futures",
  "governor",
  "hex",
  "prometheus",

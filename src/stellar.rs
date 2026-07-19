@@ -12,7 +12,7 @@ use std::{
 use thiserror::Error;
 
 use crate::{
-    cache::CacheKey, config::AppConfig, hash_validator::CanonicalHash,
+    cache::{CacheBackend, CacheKey}, config::AppConfig, hash_validator::CanonicalHash,
 };
 
 use crate::metrics::MetricsRegistry;
@@ -32,6 +32,7 @@ pub struct StellarClient {
     max_retries: u32,
     metrics: Option<Arc<MetricsRegistry>>,
     config: StellarClientConfig,
+    cache: Option<Arc<CacheBackend>>,
 }
 
 #[derive(Debug, Clone)]
@@ -208,6 +209,7 @@ impl StellarClient {
             max_retries: config.retry.max_retries,
             metrics: None,
             config,
+            cache: None,
         }
     }
 
@@ -224,6 +226,34 @@ impl StellarClient {
     pub fn with_metrics(mut self, metrics: Arc<MetricsRegistry>) -> Self {
         self.metrics = Some(metrics);
         self
+    }
+
+    pub fn with_cache(mut self, cache: Arc<CacheBackend>) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    /// Warm the cache with pre-known verification results.
+    /// This is useful for loading frequently accessed hashes at startup.
+    pub async fn warm_cache(&self, entries: Vec<(String, VerificationResult, u64)>) -> Result<usize> {
+        if let Some(cache) = &self.cache {
+            if let CacheBackend::InMemory(inmem) = cache.as_ref() {
+                let cache_entries: Vec<_> = entries
+                    .into_iter()
+                    .map(|(hash, result, ttl)| {
+                        let key = CacheKey::verification(&hash);
+                        let value = serde_json::to_string(&result).unwrap_or_default();
+                        (key, value, ttl)
+                    })
+                    .collect();
+                
+                inmem.warm(cache_entries).await
+            } else {
+                Ok(0) // Redis warming not implemented yet
+            }
+        } else {
+            Ok(0)
+        }
     }
 
     pub fn verification_cache_key(hash: &str) -> CacheKey {

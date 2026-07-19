@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::{event::Event, metrics::MetricsRegistry};
+use crate::{cache::CacheKey, event::Event, metrics::MetricsRegistry};
 
 const MAX_DLQ_DEPTH: usize = 10_000;
 
@@ -112,6 +112,8 @@ pub struct WebhookDispatcher {
     jitter_enabled: bool,
     metrics: Option<Arc<MetricsRegistry>>,
     dlq: Arc<Mutex<VecDeque<DeadLetterEntry>>>,
+    cache: Option<Arc<crate::cache::CacheBackend>>,
+    deduplication_ttl: u64,
 }
 
 impl WebhookDispatcher {
@@ -131,6 +133,8 @@ impl WebhookDispatcher {
             jitter_enabled: config.jitter_enabled,
             metrics,
             dlq: Arc::new(Mutex::new(VecDeque::new())),
+            cache: None,
+            deduplication_ttl: 3600, // 1 hour default
         }
     }
 
@@ -153,6 +157,16 @@ impl WebhookDispatcher {
         )
     }
 
+    pub fn with_cache(mut self, cache: Arc<crate::cache::CacheBackend>) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    pub fn with_deduplication_ttl(mut self, ttl: u64) -> Self {
+        self.deduplication_ttl = ttl;
+        self
+    }
+
     /// Dispatch `event` to all configured URLs in registration order.
     ///
     /// Each URL is attempted independently. Failed deliveries are retried with exponential
@@ -161,6 +175,23 @@ impl WebhookDispatcher {
     pub async fn dispatch(&self, event: &Event) {
         if self.urls.is_empty() {
             return;
+        }
+
+        // Check for duplicate delivery using cache
+        if let Some(cache) = &self.cache {
+            let dedup_key = format!("webhook:{}", event.idempotency_key);
+            let cache_key = CacheKey::Events(dedup_key);
+            
+            if let Ok(Some(_)) = cache.get_raw(&cache_key).await {
+                // Already delivered, skip
+                if let Some(ref m) = self.metrics {
+                    m.increment_webhook_retry(); // Count as a skip/retry
+                }
+                return;
+            }
+            
+            // Mark as delivered
+            let _ = cache.set_raw(&cache_key, "delivered", self.deduplication_ttl).await;
         }
 
         let payload = WebhookPayload::from(event);
