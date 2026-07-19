@@ -692,6 +692,7 @@ impl InMemoryCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use std::time::Duration;
     use tokio::time::sleep;
 
@@ -1056,7 +1057,7 @@ mod tests {
         
         let cache = match backend {
             CacheBackend::InMemory(c) => c,
-            _ => panic!("Expected InMemoryCache"),
+            _ => std::panic!("Expected InMemoryCache"),
         };
         
         let stats = cache.stats().await;
@@ -1077,7 +1078,7 @@ mod tests {
         
         let cache = match backend {
             CacheBackend::InMemory(c) => c,
-            _ => panic!("Expected InMemoryCache"),
+            _ => std::panic!("Expected InMemoryCache"),
         };
         
         let stats = cache.stats().await;
@@ -1096,7 +1097,7 @@ mod tests {
         
         let cache = match backend {
             CacheBackend::InMemory(c) => c,
-            _ => panic!("Expected InMemoryCache"),
+            _ => std::panic!("Expected InMemoryCache"),
         };
         
         let keys = vec![
@@ -1145,16 +1146,15 @@ mod tests {
         cache.delete(&CacheKey::Verification("event_key".to_string())).await.unwrap();
         
         // Check events
-        let events: Vec<_> = futures::stream::iter([&mut rx])
-            .flat_map(|rx| futures::StreamExt::stream::unfold(rx, |mut rx| async move {
-                match rx.recv().await {
-                    Ok(event) => Some((event, rx)),
-                    Err(_) => None,
-                }
-            }))
-            .take(3)
-            .collect()
-            .await;
+        let events: Vec<_> = futures::stream::unfold(&mut rx, |rx| async move {
+            match rx.recv().await {
+                Ok(event) => Some((event, rx)),
+                Err(_) => None,
+            }
+        })
+        .take(3)
+        .collect()
+        .await;
         
         assert_eq!(events.len(), 3);
         matches!(events[0], CacheEvent::Updated { .. });
@@ -1179,7 +1179,7 @@ mod tests {
         if let Ok(Ok(CacheEvent::Expired { .. })) = event {
             // Correct event type
         } else {
-            panic!("Expected Expired event");
+            std::panic!("Expected Expired event");
         }
     }
 
@@ -1198,7 +1198,7 @@ mod tests {
         if let Ok(Ok(CacheEvent::Evicted { .. })) = event {
             // Correct event type
         } else {
-            panic!("Expected Evicted event");
+            std::panic!("Expected Evicted event");
         }
     }
 

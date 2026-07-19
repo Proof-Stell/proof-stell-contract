@@ -898,6 +898,10 @@ mod tests {
             webhook_request_timeout_ms: 10_000,
             webhook_jitter_enabled: true,
             cache_verification_ttl: 3600,
+            cache_backend: "inmemory".to_string(),
+            cache_max_size: 10000,
+            cache_config_ttl: 3600,
+            cache_events_ttl: 1800,
         };
 
         let debug = format!("{:?}", config);
