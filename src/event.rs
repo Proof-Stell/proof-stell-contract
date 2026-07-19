@@ -7,6 +7,7 @@ use alloc::{
 use std::collections::{HashMap, HashSet};
 use std::prelude::v1::*;
 use std::sync::Arc;
+use tokio::sync::broadcast;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -211,14 +212,26 @@ pub struct EventIngestor {
     last_sequence: HashMap<String, u64>,
     /// Metrics registry for instrumentation.
     metrics: Option<Arc<crate::metrics::MetricsRegistry>>,
+    /// Event broadcast channel for cache invalidation notifications.
+    event_tx: broadcast::Sender<EventInvalidation>,
+}
+
+/// Event invalidation notification for cache coordination.
+#[derive(Debug, Clone)]
+pub enum EventInvalidation {
+    DocumentRegistered { aggregate_id: String },
+    DocumentRevoked { aggregate_id: String },
+    DocumentVerified { aggregate_id: String },
 }
 
 impl EventIngestor {
     pub fn new() -> Self {
+        let (event_tx, _) = broadcast::channel(100);
         Self {
             seen_keys: HashSet::new(),
             last_sequence: HashMap::new(),
             metrics: None,
+            event_tx,
         }
     }
 
@@ -228,6 +241,11 @@ impl EventIngestor {
     ) -> Self {
         self.metrics = Some(metrics);
         self
+    }
+
+    /// Subscribe to event invalidation notifications for cache coordination.
+    pub fn subscribe(&self) -> broadcast::Receiver<EventInvalidation> {
+        self.event_tx.subscribe()
     }
 
     /// Attempt to ingest an event, recording appropriate metrics.
@@ -263,6 +281,24 @@ impl EventIngestor {
         // Accept the event
         self.last_sequence
             .insert(event.aggregate_id.clone(), event.sequence);
+
+        // Broadcast invalidation notification based on event type
+        let invalidation = match event.event_type.as_str() {
+            EVENT_DOCUMENT_REGISTERED => Some(EventInvalidation::DocumentRegistered {
+                aggregate_id: event.aggregate_id.clone(),
+            }),
+            EVENT_DOCUMENT_REVOKED => Some(EventInvalidation::DocumentRevoked {
+                aggregate_id: event.aggregate_id.clone(),
+            }),
+            EVENT_DOCUMENT_VERIFIED => Some(EventInvalidation::DocumentVerified {
+                aggregate_id: event.aggregate_id.clone(),
+            }),
+            _ => None,
+        };
+
+        if let Some(invalidation) = invalidation {
+            let _ = self.event_tx.send(invalidation);
+        }
 
         // Update backlog gauge (increment on accept)
         if let Some(ref m) = self.metrics {
