@@ -62,6 +62,7 @@ mod native {
         Router::new()
             .route("/health", get(health_handler))
             .route("/metrics", get(metrics_handler))
+            .route("/webhooks/health", get(webhook_health_handler))
             .route("/webhooks/dlq", get(dlq_status_handler))
             .route("/webhooks/dlq/drain", post(dlq_drain_handler))
             .route("/cache/stats", get(cache_stats_handler))
@@ -117,6 +118,18 @@ mod native {
     async fn dlq_drain_handler(State(state): State<AppState>) -> impl IntoResponse {
         let entries = state.webhook.drain_dlq().await;
         Json(json!({ "drained": entries.len(), "entries": entries }))
+    }
+
+    /// `GET /webhooks/health` — returns the webhook subsystem health status.
+    async fn webhook_health_handler(State(state): State<AppState>) -> impl IntoResponse {
+        let dlq_depth = state.webhook.dlq_depth().await;
+        let url_count = state.webhook.url_count().await;
+        let is_healthy = dlq_depth == 0 && url_count > 0;
+        Json(json!({
+            "status": if is_healthy { "healthy" } else if url_count == 0 { "disabled" } else { "degraded" },
+            "url_count": url_count,
+            "dlq_depth": dlq_depth,
+        }))
     }
 
     /// `GET /cache/stats` — returns cache statistics.
