@@ -7,18 +7,72 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use tokio::sync::Mutex;
 
 use crate::{cache::CacheKey, event::Event, metrics::MetricsRegistry};
 
 const MAX_DLQ_DEPTH: usize = 10_000;
 
+/// Prefix for Redis-backed DLQ storage keys.
+const DLQ_REDIS_KEY_PREFIX: &str = "webhook:dlq:";
+
+/// Prefix for deduplication cache keys.
+const DEDUP_KEY_PREFIX: &str = "webhook:dedup:";
+
+/// HMAC-SHA256 type alias for webhook request signing.
+type HmacSha256 = Hmac<Sha256>;
+
+/// Compute an HMAC-SHA256 signature for a webhook payload.
+///
+/// The signature is computed over the serialized JSON body using the configured
+/// webhook secret. Receivers can verify the signature using the shared secret.
+fn compute_webhook_signature(secret: &str, body: &[u8]) -> String {
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .expect("HMAC-SHA256 accepts any key length");
+    mac.update(body);
+    let result = mac.finalize();
+    let code = result.into_bytes();
+    hex::encode(code)
+}
+
 /// The outbound payload delivered to each webhook URL.
 ///
 /// Receivers can use `idempotency_key` to safely deduplicate retried deliveries —
 /// the key is derived from the Soroban transaction hash and event index, so it is
 /// stable across replays of the same on-chain event.
+///
+/// ## Idempotency Protocol
+///
+/// Every webhook delivery carries:
+/// - `X-Idempotency-Key`: A stable, deterministic key derived from the on-chain
+///   event. Receivers **must** store this key (along with the HTTP 200 response)
+///   and reject/ignore subsequent deliveries with the same key.
+/// - `X-Signature-256`: HMAC-SHA256 of the JSON body, computed with the shared
+///   `WEBHOOK_SECRET`. Receivers **should** verify this signature before processing
+///   the payload.
+/// - `X-Event-Id`: The unique event UUID for traceability.
+/// - `X-Event-Type`: The event type discriminator (e.g. `DocumentRegistered`).
+///
+/// ### Receiver Implementation (recommended)
+///
+/// ```text
+/// POST /webhook
+/// Content-Type: application/json
+/// X-Idempotency-Key: contract:abc123:42:0:doc-1:DocumentRegistered
+/// X-Signature-256: 3a8f1b2c...
+/// X-Event-Id: 550e8400-e29b-41d4-a716-446655440000
+/// X-Event-Type: DocumentRegistered
+///
+/// { "event_id": "...", "event_type": "DocumentRegistered", ... }
+/// ```
+///
+/// 1. Check `X-Idempotency-Key` against your store; if seen before, return 200 OK.
+/// 2. Verify `X-Signature-256` using the shared secret.
+/// 3. Process the payload.
+/// 4. Store the idempotency key with a TTL >= 1 hour.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebhookPayload {
     pub event_id: String,
@@ -100,8 +154,15 @@ impl Default for WebhookDispatcherConfig {
 /// deliveries.
 ///
 /// ## Dead-letter queue
-/// Failed deliveries are pushed to an in-memory bounded queue (max 10 000 entries).
-/// Call [`WebhookDispatcher::drain_dlq`] to retrieve entries for manual replay.
+/// Failed deliveries are pushed to a bounded queue (max 10 000 entries). When a Redis
+/// cache backend is configured, the DLQ is persisted to Redis for durability across
+/// process restarts. Call [`WebhookDispatcher::drain_dlq`] to retrieve entries for
+/// manual replay.
+///
+/// ## Request Signing
+/// When a `WEBHOOK_SECRET` is configured, every delivery includes an `X-Signature-256`
+/// header containing the HMAC-SHA256 digest of the JSON body. Receivers should verify
+/// this signature before processing.
 pub struct WebhookDispatcher {
     urls: Vec<String>,
     client: reqwest::Client,
@@ -177,20 +238,20 @@ impl WebhookDispatcher {
             return;
         }
 
-        // Check for duplicate delivery using cache
+        // Check for duplicate delivery using cache (Redis-backed for cross-restart durability)
         if let Some(cache) = &self.cache {
-            let dedup_key = format!("webhook:{}", event.idempotency_key);
+            let dedup_key = format!("{}{}", DEDUP_KEY_PREFIX, event.idempotency_key);
             let cache_key = CacheKey::Events(dedup_key);
             
             if let Ok(Some(_)) = cache.get_raw(&cache_key).await {
                 // Already delivered, skip
                 if let Some(ref m) = self.metrics {
-                    m.increment_webhook_retry(); // Count as a skip/retry
+                    m.increment_webhook_retry();
                 }
                 return;
             }
             
-            // Mark as delivered
+            // Mark as delivered with TTL
             let _ = cache.set_raw(&cache_key, "delivered", self.deduplication_ttl).await;
         }
 
@@ -257,10 +318,24 @@ impl WebhookDispatcher {
             failed_at: Utc::now(),
         };
 
-        let dlq_depth = {
+        // Persist to Redis-backed DLQ if cache is available for durability across restarts.
+        // When cache is available, skip the in-memory DLQ to avoid duplication on drain.
+        let dlq_depth = if let Some(cache) = &self.cache {
+            let dlq_key = CacheKey::Events(format!("{}{}", DLQ_REDIS_KEY_PREFIX, url));
+            let serialized = serde_json::to_string(&entry).unwrap_or_default();
+            let _ = cache.set_raw(&dlq_key, &serialized, 604800).await;
+            // Approximate depth: count persisted entries per URL
+            let mut count = 0usize;
+            for u in &self.urls {
+                let k = CacheKey::Events(format!("{}{}", DLQ_REDIS_KEY_PREFIX, u));
+                if let Ok(Some(_)) = cache.get_raw(&k).await {
+                    count += 1;
+                }
+            }
+            count
+        } else {
             let mut dlq = self.dlq.lock().await;
             if dlq.len() >= MAX_DLQ_DEPTH {
-                // Evict oldest entry when the queue is full.
                 dlq.pop_front();
             }
             dlq.push_back(entry);
@@ -282,14 +357,16 @@ impl WebhookDispatcher {
             .header("Content-Type", "application/json")
             .header("X-Idempotency-Key", &payload.idempotency_key)
             .header("X-Event-Id", &payload.event_id)
-            .header("X-Event-Type", &payload.event_type)
-            .body(body);
+            .header("X-Event-Type", &payload.event_type);
 
         if let Some(ref secret) = self.secret {
-            builder = builder.header("X-Webhook-Secret", secret);
+            let signature = compute_webhook_signature(secret, body.as_bytes());
+            builder = builder
+                .header("X-Signature-256", &signature)
+                .header("X-Webhook-Secret", secret);
         }
 
-        let response = builder.send().await?;
+        let response = builder.body(body).send().await?;
         let status = response.status();
 
         if status.is_success() {
@@ -314,10 +391,26 @@ impl WebhookDispatcher {
 
     /// Drain and return all dead-letter entries for manual replay.
     ///
-    /// After draining, the DLQ depth metric is reset to zero.
+    /// When a cache backend is configured, entries are loaded from persistent storage
+    /// (which is the single source of truth). Otherwise, they are drained from the
+    /// in-memory queue. After draining, the DLQ depth metric is reset to zero.
     pub async fn drain_dlq(&self) -> Vec<DeadLetterEntry> {
-        let mut dlq = self.dlq.lock().await;
-        let entries: Vec<_> = dlq.drain(..).collect();
+        let entries: Vec<DeadLetterEntry> = if let Some(cache) = &self.cache {
+            let mut drained = Vec::new();
+            for url in &self.urls {
+                let dlq_key = CacheKey::Events(format!("{}{}", DLQ_REDIS_KEY_PREFIX, url));
+                if let Ok(Some(raw)) = cache.get_raw(&dlq_key).await {
+                    if let Ok(entry) = serde_json::from_str::<DeadLetterEntry>(&raw) {
+                        drained.push(entry);
+                    }
+                }
+                let _ = cache.delete(&dlq_key).await;
+            }
+            drained
+        } else {
+            let mut dlq = self.dlq.lock().await;
+            dlq.drain(..).collect()
+        };
 
         if let Some(ref m) = self.metrics {
             m.set_webhook_dlq_depth(0);
@@ -326,9 +419,25 @@ impl WebhookDispatcher {
         entries
     }
 
-    /// Current number of entries in the dead-letter queue.
+    /// Number of configured webhook URLs.
+    pub async fn url_count(&self) -> usize {
+        self.urls.len()
+    }
+
+    /// Current number of entries in the dead-letter queue (in-memory + persisted).
     pub async fn dlq_depth(&self) -> usize {
-        self.dlq.lock().await.len()
+        if let Some(cache) = &self.cache {
+            let mut count = 0usize;
+            for url in &self.urls {
+                let dlq_key = CacheKey::Events(format!("{}{}", DLQ_REDIS_KEY_PREFIX, url));
+                if let Ok(Some(_)) = cache.get_raw(&dlq_key).await {
+                    count += 1;
+                }
+            }
+            count
+        } else {
+            self.dlq.lock().await.len()
+        }
     }
 }
 
@@ -347,6 +456,7 @@ fn jitter_ms(max_ms: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::{CacheBackend, InMemoryCache};
     use std::sync::Arc;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -724,5 +834,166 @@ mod tests {
         assert_eq!(payload.sequence, event.sequence);
         assert_eq!(payload.aggregate_id, event.aggregate_id);
         assert_eq!(payload.actor, event.actor);
+    }
+
+    // ── HMAC-SHA256 Signature ──────────────────────────────────────────────
+
+    #[test]
+    fn compute_webhook_signature_produces_expected_output() {
+        let secret = "test-secret";
+        let body = br#"{"event_id":"evt-1"}"#;
+        let sig = compute_webhook_signature(secret, body);
+        // HMAC-SHA256 should produce a 64-character hex string
+        assert_eq!(sig.len(), 64);
+        assert!(sig.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn compute_webhook_signature_different_secrets_produce_different_signatures() {
+        let body = b"hello";
+        let sig1 = compute_webhook_signature("secret1", body);
+        let sig2 = compute_webhook_signature("secret2", body);
+        assert_ne!(sig1, sig2);
+    }
+
+    #[test]
+    fn compute_webhook_signature_different_bodies_produce_different_signatures() {
+        let sig1 = compute_webhook_signature("s", b"body1");
+        let sig2 = compute_webhook_signature("s", b"body2");
+        assert_ne!(sig1, sig2);
+    }
+
+    #[tokio::test]
+    async fn dispatch_sends_signature_header_when_secret_configured() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let config = WebhookDispatcherConfig {
+            urls: vec![server.uri()],
+            secret: Some("whsec_test".to_string()),
+            max_retries: 0,
+            ..Default::default()
+        };
+
+        let dispatcher = WebhookDispatcher::new(config, None);
+        dispatcher.dispatch(&make_event()).await;
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        let sig_header = reqs[0].headers.get("x-signature-256");
+        assert!(sig_header.is_some());
+        let sig_value = sig_header.unwrap().to_str().unwrap();
+        assert_eq!(sig_value.len(), 64);
+    }
+
+    // ── Deduplication ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn deduplication_skips_already_delivered_event() {
+        use crate::cache::InMemoryCache;
+        let server1 = MockServer::start().await;
+        let server2 = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server1)
+            .await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server2)
+            .await;
+
+        let cache = Arc::new(CacheBackend::InMemory(InMemoryCache::new()));
+        let config = WebhookDispatcherConfig {
+            urls: vec![server1.uri(), server2.uri()],
+            max_retries: 0,
+            ..Default::default()
+        };
+
+        let dispatcher = WebhookDispatcher::new(config, None)
+            .with_cache(Arc::clone(&cache))
+            .with_deduplication_ttl(3600);
+
+        let event = make_event();
+
+        // First dispatch should deliver to both URLs
+        dispatcher.dispatch(&event).await;
+        assert_eq!(server1.received_requests().await.unwrap().len(), 1);
+        assert_eq!(server2.received_requests().await.unwrap().len(), 1);
+
+        // Second dispatch should be skipped entirely (dedup)
+        dispatcher.dispatch(&event).await;
+        assert_eq!(server1.received_requests().await.unwrap().len(), 1);
+        assert_eq!(server2.received_requests().await.unwrap().len(), 1);
+    }
+
+    // ── DLQ Persistence ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn dead_lettered_entry_is_persisted_to_cache() {
+        use crate::cache::InMemoryCache;
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let cache = Arc::new(CacheBackend::InMemory(InMemoryCache::new()));
+        let config = WebhookDispatcherConfig {
+            urls: vec![server.uri()],
+            max_retries: 0,
+            ..Default::default()
+        };
+
+        let dispatcher = WebhookDispatcher::new(config, None)
+            .with_cache(Arc::clone(&cache));
+        dispatcher.dispatch(&make_event()).await;
+
+        let dlq_key = CacheKey::Events(format!("{}{}", DLQ_REDIS_KEY_PREFIX, server.uri()));
+        let persisted = cache.get_raw(&dlq_key).await.unwrap();
+        assert!(persisted.is_some(), "DLQ entry should be persisted to cache");
+
+        let entry: DeadLetterEntry = serde_json::from_str(&persisted.unwrap()).unwrap();
+        assert_eq!(entry.url, server.uri());
+        assert_eq!(entry.attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn drain_dlq_removes_persisted_entries() {
+        use crate::cache::InMemoryCache;
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let cache = Arc::new(CacheBackend::InMemory(InMemoryCache::new()));
+        let config = WebhookDispatcherConfig {
+            urls: vec![server.uri()],
+            max_retries: 0,
+            ..Default::default()
+        };
+
+        let dispatcher = WebhookDispatcher::new(config, None)
+            .with_cache(Arc::clone(&cache));
+        dispatcher.dispatch(&make_event()).await;
+
+        // Drain returns the persisted entry (single source of truth when cache is available)
+        let entries = dispatcher.drain_dlq().await;
+        assert_eq!(entries.len(), 1);
+
+        // Cache entry should be cleared after drain
+        let dlq_key = CacheKey::Events(format!("{}{}", DLQ_REDIS_KEY_PREFIX, server.uri()));
+        assert!(cache.get_raw(&dlq_key).await.unwrap().is_none());
+        // Both in-memory and persisted entries are cleared
+        assert_eq!(dispatcher.dlq_depth().await, 0);
     }
 }
