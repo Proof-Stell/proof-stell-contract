@@ -43,7 +43,7 @@ mod native {
     use serde_json::json;
 
     use proofstell_contract::cache::{CacheBackend, InMemoryCache};
-    use proofstell_contract::config::AppConfig;
+    use proofstell_contract::config::{self, AppConfig, ConfigUpdate, ConfigWatcher};
     use proofstell_contract::metrics::MetricsRegistry;
     use proofstell_contract::webhook::WebhookDispatcher;
 
@@ -53,6 +53,8 @@ mod native {
         metrics: Arc<MetricsRegistry>,
         webhook: Arc<WebhookDispatcher>,
         cache: Arc<CacheBackend>,
+        config_watcher: ConfigWatcher,
+        config_version: u32,
     }
 
     /// Build the axum router with all application routes.
@@ -63,6 +65,8 @@ mod native {
             .route("/webhooks/dlq", get(dlq_status_handler))
             .route("/webhooks/dlq/drain", post(dlq_drain_handler))
             .route("/cache/stats", get(cache_stats_handler))
+            .route("/config/status", get(config_status_handler))
+            .route("/config/reload", post(config_reload_handler))
             .with_state(state)
     }
 
@@ -74,6 +78,33 @@ mod native {
     /// `GET /metrics` — returns Prometheus text-format metrics.
     async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
         state.metrics.render()
+    }
+
+    /// `GET /config/status` — returns current config version info.
+    async fn config_status_handler(State(state): State<AppState>) -> impl IntoResponse {
+        Json(json!({
+            "config_version": state.config_version,
+            "schema_version": AppConfig::version(),
+        }))
+    }
+
+    /// `POST /config/reload` — triggers a config reload from environment variables.
+    async fn config_reload_handler(State(state): State<AppState>) -> impl IntoResponse {
+        match AppConfig::from_env_with_metrics(Some(Arc::clone(&state.metrics))) {
+            Ok(new_config) => {
+                match ConfigUpdate::new(new_config) {
+                    Ok(update) => {
+                        if state.config_watcher.send(update).is_ok() {
+                            Json(json!({"status": "ok", "message": "config reload triggered successfully"}))
+                        } else {
+                            Json(json!({"status": "error", "message": "no subscribers for config update"}))
+                        }
+                    }
+                    Err(e) => Json(json!({"status": "error", "message": e.to_string()})),
+                }
+            }
+            Err(e) => Json(json!({"status": "error", "message": e.to_string()})),
+        }
     }
 
     /// `GET /webhooks/dlq` — returns the current DLQ depth.
@@ -126,7 +157,7 @@ mod native {
         let config = AppConfig::from_env_with_metrics(Some(Arc::clone(&metrics)))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        eprintln!("[proofstell] Configuration loaded successfully");
+        eprintln!("[proofstell] Configuration v{} loaded successfully", AppConfig::version());
         eprintln!("[proofstell]   port:               {}", config.port);
         eprintln!(
             "[proofstell]   stellar_horizon_url: {}",
@@ -147,6 +178,10 @@ mod native {
             config.cache_backend,
             config.cache_max_size
         );
+
+        // ── Create config hot-reload channel ─────────────────────────
+        let (config_watcher, mut config_rx) = config::config_channel(config.clone())
+            .map_err(|e| anyhow::anyhow!("failed to create config channel: {e}"))?;
 
         // ── Cache initialization ───────────────────────────────────────
         let cache: Arc<CacheBackend> = match config.cache_backend.as_str() {
@@ -181,17 +216,33 @@ mod native {
             Some(Arc::clone(&metrics)),
         ));
 
+        // ── Background config watcher task ──────────────────────────
+        let bg_metrics = Arc::clone(&metrics);
+        tokio::spawn(async move {
+            while config_rx.changed().await.is_ok() {
+                let update = config_rx.borrow_and_update().clone();
+                eprintln!(
+                    "[proofstell] Config hot-reload: version={} applied",
+                    update.version.value()
+                );
+                bg_metrics.increment_config_reload();
+            }
+        });
+
         // ── Router ──────────────────────────────────────────────────
         let state = AppState {
             metrics: Arc::clone(&metrics),
             webhook,
             cache,
+            config_watcher,
+            config_version: AppConfig::version(),
         };
         let app = build_router(state);
 
         // ── Bind & serve ────────────────────────────────────────────
         let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
         eprintln!("[proofstell] Starting HTTP server on {addr}");
+        eprintln!("[proofstell] Config endpoints: GET /config/status, POST /config/reload");
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
         axum::serve(listener, app).await?;
