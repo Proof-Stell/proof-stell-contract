@@ -1,7 +1,10 @@
 use std::{env, fmt, string::{String, ToString}, sync::Arc, vec::Vec};
 use thiserror::Error;
 use stellar_strkey::ed25519::PrivateKey;
-use url::Url;
+
+use crate::metrics::MetricsRegistry;
+
+// ── Constants ─────────────────────────────────────────────────────────────
 
 const DEFAULT_STELLAR_RETRY_BASE_DELAY_MS: u64 = 100;
 const DEFAULT_STELLAR_RETRY_MAX_DELAY_MS: u64 = 10_000;
@@ -9,7 +12,177 @@ const DEFAULT_STELLAR_REQUEST_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_STELLAR_CIRCUIT_BREAKER_FAILURE_THRESHOLD: u32 = 5;
 const DEFAULT_STELLAR_CIRCUIT_BREAKER_OPEN_DURATION_MS: u64 = 30_000;
 const DEFAULT_STELLAR_CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS: u32 = 1;
-use crate::metrics::MetricsRegistry;
+
+/// Current configuration schema version.
+/// Increment this when adding or removing fields that break backward compatibility.
+pub const CONFIG_VERSION: u32 = 1;
+
+/// Minimum port number allowed.
+pub const PORT_MIN: u16 = 1;
+/// Maximum port number allowed.
+pub const PORT_MAX: u16 = 65535;
+
+/// Minimum allowable delay/timeout in milliseconds.
+pub const MIN_TIMEOUT_MS: u64 = 1;
+/// Maximum allowable delay/timeout in milliseconds.
+pub const MAX_TIMEOUT_MS: u64 = 300_000; // 5 minutes
+
+/// Minimum rate limit burst (must be at least 1).
+pub const MIN_BURST: u32 = 1;
+
+// ── Strongly-typed wrapper types ──────────────────────────────────────────
+
+/// A validated HTTP(S) URL.
+#[derive(Debug, Clone)]
+pub struct ValidatedUrl(url::Url);
+
+impl ValidatedUrl {
+    pub fn parse(input: &str) -> Result<Self, ConfigError> {
+        let url = url::Url::parse(input).map_err(|_| {
+            ConfigError::Validation(format!("invalid URL: '{}'", input))
+        })?;
+        if url.scheme() != "http" && url.scheme() != "https" {
+            return Err(ConfigError::Validation(format!(
+                "URL must use http or https scheme, got '{}' in '{}'",
+                url.scheme(),
+                input
+            )));
+        }
+        Ok(Self(url))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    pub fn into_inner(self) -> url::Url {
+        self.0
+    }
+}
+
+impl AsRef<str> for ValidatedUrl {
+    fn as_ref(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+/// A validated redis:// or rediss:// URL.
+#[derive(Debug, Clone)]
+pub struct ValidatedRedisUrl(url::Url);
+
+impl ValidatedRedisUrl {
+    pub fn parse(input: &str) -> Result<Self, ConfigError> {
+        let url = url::Url::parse(input).map_err(|_| {
+            ConfigError::Validation(format!("invalid Redis URL: '{}'", input))
+        })?;
+        if url.scheme() != "redis" && url.scheme() != "rediss" {
+            return Err(ConfigError::Validation(format!(
+                "REDIS_URL must use redis:// or rediss:// scheme, got '{}'",
+                url.scheme()
+            )));
+        }
+        Ok(Self(url))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    pub fn into_inner(self) -> url::Url {
+        self.0
+    }
+}
+
+/// A validated port number.
+#[derive(Debug, Clone, Copy)]
+pub struct ValidatedPort(u16);
+
+impl ValidatedPort {
+    pub fn new(port: u16) -> Result<Self, ConfigError> {
+        if port < PORT_MIN {
+            return Err(ConfigError::Validation(format!(
+                "port {} is below minimum {}",
+                port, PORT_MIN
+            )));
+        }
+        if port > PORT_MAX {
+            return Err(ConfigError::Validation(format!(
+                "port {} exceeds maximum {}",
+                port, PORT_MAX
+            )));
+        }
+        Ok(Self(port))
+    }
+
+    pub fn value(&self) -> u16 {
+        self.0
+    }
+}
+
+impl From<ValidatedPort> for u16 {
+    fn from(p: ValidatedPort) -> Self {
+        p.0
+    }
+}
+
+// ── Config versioning ────────────────────────────────────────────────────
+
+/// Configuration version tracking for rollback prevention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigVersion(u32);
+
+impl ConfigVersion {
+    pub fn new(version: u32) -> Result<Self, ConfigError> {
+        if version == 0 {
+            return Err(ConfigError::Validation(
+                "config version must be >= 1".to_string(),
+            ));
+        }
+        if version > CONFIG_VERSION {
+            return Err(ConfigError::Validation(format!(
+                "config version {} exceeds current schema version {}",
+                version, CONFIG_VERSION
+            )));
+        }
+        Ok(Self(version))
+    }
+
+    pub fn current() -> Self {
+        Self(CONFIG_VERSION)
+    }
+
+    pub fn value(&self) -> u32 {
+        self.0
+    }
+}
+
+// ── Hot-reload channel ───────────────────────────────────────────────────
+
+/// A configuration update notification sent through the hot-reload channel.
+#[derive(Debug, Clone)]
+pub struct ConfigUpdate {
+    pub config: AppConfig,
+    pub version: ConfigVersion,
+}
+
+impl ConfigUpdate {
+    pub fn new(config: AppConfig) -> Result<Self, ConfigError> {
+        let version = ConfigVersion::current();
+        Ok(Self { config, version })
+    }
+}
+
+/// Type alias for the hot-reload watch channel.
+pub type ConfigWatcher = std::sync::Arc<tokio::sync::watch::Sender<ConfigUpdate>>;
+
+/// Create a new hot-reload channel with the given initial config.
+pub fn config_channel(initial: AppConfig) -> Result<(ConfigWatcher, tokio::sync::watch::Receiver<ConfigUpdate>), ConfigError> {
+    let update = ConfigUpdate::new(initial)?;
+    let (tx, rx) = tokio::sync::watch::channel(update);
+    Ok((std::sync::Arc::new(tx), rx))
+}
+
+// ── Main configuration struct ───────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct AppConfig {
@@ -147,6 +320,51 @@ impl AppConfig {
             env::var(key).unwrap_or_else(|_| default.to_string())
         }
 
+        // ── Environment variable documentation ──────────────────────────
+        // Each variable is documented with its purpose, default, and validation rules.
+        // 
+        // NETWORK:
+        //   PORT                    - HTTP listen port (1-65535, default: 8080)
+        //   LOG_LEVEL               - Logging level (default: "info")
+        //
+        // STELLAR:
+        //   STELLAR_HORIZON_URL     - Horizon API base URL (default: https://horizon-testnet.stellar.org)
+        //   STELLAR_SECRET_KEY      - Stellar ed25519 secret key (required, validated format)
+        //   STELLAR_MAX_RETRIES     - Max retries for Horizon requests (default: 3)
+        //   STELLAR_RETRY_BASE_DELAY_MS - Base retry delay (default: 100, min: 1, max: 300000)
+        //   STELLAR_RETRY_MAX_DELAY_MS  - Max retry delay (default: 10000)
+        //   STELLAR_RETRY_JITTER    - Enable jitter on retry delays (default: true)
+        //   STELLAR_REQUEST_TIMEOUT_MS - Horizon request timeout (default: 10000)
+        //   STELLAR_CIRCUIT_BREAKER_FAILURE_THRESHOLD - Failures before circuit opens (default: 5)
+        //   STELLAR_CIRCUIT_BREAKER_OPEN_DURATION_MS - Duration circuit stays open (default: 30000)
+        //   STELLAR_CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS - Probes in half-open state (default: 1)
+        //
+        // RATE LIMITING:
+        //   RATE_LIMIT_PER_SECOND           - Global requests/sec (default: 100, min: 1)
+        //   RATE_LIMIT_BURST                - Global burst (default: = RATE_LIMIT_PER_SECOND, must be >= RPS)
+        //   PER_ISSUER_RATE_LIMIT_PER_SECOND - Per-issuer requests/sec (default: 10, must not exceed global)
+        //   PER_ISSUER_RATE_LIMIT_BURST     - Per-issuer burst (default: 2x RPS, must be >= RPS)
+        //   ISSUER_RATE_LIMIT_TTL_SECONDS   - Issuer entry TTL (default: 3600)
+        //
+        // REDIS:
+        //   REDIS_URL               - Redis connection URL (redis:// or rediss://, default: redis://127.0.0.1:6379)
+        //
+        // WEBHOOKS:
+        //   WEBHOOK_URLS            - Comma-separated webhook URLs
+        //   WEBHOOK_SECRET          - Secret for webhook request signing
+        //   WEBHOOK_MAX_RETRIES     - Max webhook delivery retries (default: 5)
+        //   WEBHOOK_RETRY_BASE_DELAY_MS - Base retry delay for webhooks (default: 200)
+        //   WEBHOOK_RETRY_MAX_DELAY_MS  - Max retry delay for webhooks (default: 30000)
+        //   WEBHOOK_REQUEST_TIMEOUT_MS  - Webhook request timeout (default: 10000)
+        //   WEBHOOK_JITTER_ENABLED  - Enable jitter on webhook retries (default: true)
+        //
+        // CACHE:
+        //   CACHE_BACKEND           - Cache backend ('redis' or 'inmemory', default: 'inmemory')
+        //   CACHE_MAX_SIZE          - Max cache entries (default: 10000)
+        //   CACHE_VERIFICATION_TTL  - TTL for verification cache (default: 3600)
+        //   CACHE_CONFIG_TTL        - TTL for config cache (default: 3600)
+        //   CACHE_EVENTS_TTL        - TTL for events cache (default: 1800)
+
         let port_raw = get_env_or_default("PORT", "8080");
         let stellar_horizon_url =
             get_env_or_default("STELLAR_HORIZON_URL", "https://horizon-testnet.stellar.org");
@@ -231,22 +449,33 @@ impl AppConfig {
         let cache_config_ttl_raw = get_env_or_default("CACHE_CONFIG_TTL", "3600");
         let cache_events_ttl_raw = get_env_or_default("CACHE_EVENTS_TTL", "1800");
 
+        // ── Port validation with bounds ──────────────────────────────────
         let port: u16 = match port_raw.parse() {
-            Ok(p) if p > 0 => p,
-            Ok(_) => {
-                errors.push("PORT must be between 1 and 65535".to_string());
-                8080
-            }
+            Ok(p) => match ValidatedPort::new(p) {
+                Ok(_) => p,
+                Err(e) => {
+                    errors.push(e.to_string());
+                    8080
+                }
+            },
             Err(_) => {
-                errors.push(format!("PORT must be a valid u16, got '{}'", port_raw));
+                errors.push(format!("PORT must be a valid u16 (1-65535), got '{}'", port_raw));
                 8080
             }
         };
 
-        if Url::parse(&stellar_horizon_url).is_err() {
+        // ── URL validations with strongly-typed wrappers ─────────────────
+        if ValidatedUrl::parse(&stellar_horizon_url).is_err() {
             errors.push(format!(
-                "STELLAR_HORIZON_URL must be a valid URL, got '{}'",
+                "STELLAR_HORIZON_URL must be a valid http/https URL, got '{}'",
                 stellar_horizon_url
+            ));
+        }
+
+        if ValidatedRedisUrl::parse(&redis_url).is_err() {
+            errors.push(format!(
+                "REDIS_URL must be a valid redis:// or rediss:// URL, got '{}'",
+                redis_url
             ));
         }
 
@@ -278,6 +507,14 @@ impl AppConfig {
 
         if rate_limit_burst == 0 {
             errors.push("RATE_LIMIT_BURST must be greater than 0".to_string());
+        }
+
+        // ── burst >= per_second validation ──────────────────────────────
+        if rate_limit_burst < rate_limit_per_second {
+            errors.push(format!(
+                "RATE_LIMIT_BURST ({}) must be >= RATE_LIMIT_PER_SECOND ({})",
+                rate_limit_burst, rate_limit_per_second
+            ));
         }
 
         // ── Parse per-issuer rate-limit values ───────────────────────────
@@ -315,6 +552,14 @@ impl AppConfig {
             }
         };
 
+        // ── Per-issuer burst >= per_second validation ───────────────────
+        if per_issuer_rate_limit_burst < per_issuer_rate_limit_per_second {
+            errors.push(format!(
+                "PER_ISSUER_RATE_LIMIT_BURST ({}) must be >= PER_ISSUER_RATE_LIMIT_PER_SECOND ({})",
+                per_issuer_rate_limit_burst, per_issuer_rate_limit_per_second
+            ));
+        }
+
         if per_issuer_rate_limit_per_second > rate_limit_per_second {
             errors.push(format!(
                 "PER_ISSUER_RATE_LIMIT_PER_SECOND ({}) must not exceed RATE_LIMIT_PER_SECOND ({})",
@@ -339,7 +584,7 @@ impl AppConfig {
             }
         };
 
-        // ── Parse remaining values ────────────────────────────────────────
+        // ── Parse remaining values with bounds checking ─────────────────
         let stellar_max_retries: u32 = match stellar_max_retries_raw.parse() {
             Ok(v) => v,
             Err(_) => {
@@ -352,7 +597,14 @@ impl AppConfig {
         };
 
         let stellar_retry_base_delay_ms: u64 = match stellar_retry_base_delay_ms_raw.parse() {
-            Ok(v) if v > 0 => v,
+            Ok(v) if v > 0 && v <= MAX_TIMEOUT_MS => v,
+            Ok(v) if v > 0 => {
+                errors.push(format!(
+                    "STELLAR_RETRY_BASE_DELAY_MS ({}) exceeds maximum {}",
+                    v, MAX_TIMEOUT_MS
+                ));
+                DEFAULT_STELLAR_RETRY_BASE_DELAY_MS
+            }
             Ok(_) => {
                 errors.push("STELLAR_RETRY_BASE_DELAY_MS must be greater than 0".to_string());
                 DEFAULT_STELLAR_RETRY_BASE_DELAY_MS
@@ -367,7 +619,14 @@ impl AppConfig {
         };
 
         let stellar_retry_max_delay_ms: u64 = match stellar_retry_max_delay_ms_raw.parse() {
-            Ok(v) if v > 0 => v,
+            Ok(v) if v > 0 && v <= MAX_TIMEOUT_MS => v,
+            Ok(v) if v > 0 => {
+                errors.push(format!(
+                    "STELLAR_RETRY_MAX_DELAY_MS ({}) exceeds maximum {}",
+                    v, MAX_TIMEOUT_MS
+                ));
+                DEFAULT_STELLAR_RETRY_MAX_DELAY_MS
+            }
             Ok(_) => {
                 errors.push("STELLAR_RETRY_MAX_DELAY_MS must be greater than 0".to_string());
                 DEFAULT_STELLAR_RETRY_MAX_DELAY_MS
@@ -394,7 +653,14 @@ impl AppConfig {
         };
 
         let stellar_request_timeout_ms: u64 = match stellar_request_timeout_ms_raw.parse() {
-            Ok(v) if v > 0 => v,
+            Ok(v) if v > 0 && v <= MAX_TIMEOUT_MS => v,
+            Ok(v) if v > 0 => {
+                errors.push(format!(
+                    "STELLAR_REQUEST_TIMEOUT_MS ({}) exceeds maximum {}",
+                    v, MAX_TIMEOUT_MS
+                ));
+                DEFAULT_STELLAR_REQUEST_TIMEOUT_MS
+            }
             Ok(_) => {
                 errors.push("STELLAR_REQUEST_TIMEOUT_MS must be greater than 0".to_string());
                 DEFAULT_STELLAR_REQUEST_TIMEOUT_MS
@@ -429,7 +695,14 @@ impl AppConfig {
 
         let stellar_circuit_breaker_open_duration_ms: u64 =
             match stellar_circuit_breaker_open_duration_ms_raw.parse() {
-                Ok(v) if v > 0 => v,
+                Ok(v) if v > 0 && v <= MAX_TIMEOUT_MS => v,
+                Ok(v) if v > 0 => {
+                    errors.push(format!(
+                        "STELLAR_CIRCUIT_BREAKER_OPEN_DURATION_MS ({}) exceeds maximum {}",
+                        v, MAX_TIMEOUT_MS
+                    ));
+                    DEFAULT_STELLAR_CIRCUIT_BREAKER_OPEN_DURATION_MS
+                }
                 Ok(_) => {
                     errors.push(
                         "STELLAR_CIRCUIT_BREAKER_OPEN_DURATION_MS must be greater than 0"
@@ -521,18 +794,15 @@ impl AppConfig {
             }
         };
 
-        match Url::parse(&redis_url) {
-            Ok(url) if matches!(url.scheme(), "redis" | "rediss") => {}
-            Ok(_) | Err(_) => {
+        // Log level validation
+        match log_level.to_lowercase().as_str() {
+            "trace" | "debug" | "info" | "warn" | "error" => {}
+            other => {
                 errors.push(format!(
-                    "REDIS_URL must be a valid redis:// or rediss:// URL, got '{}'",
-                    redis_url
+                    "LOG_LEVEL must be one of: trace, debug, info, warn, error; got '{}'",
+                    other
                 ));
             }
-        }
-
-        if rate_limit_burst == 0 {
-            errors.push("RATE_LIMIT_BURST must be greater than 0".to_string());
         }
 
         if stellar_retry_max_delay_ms < stellar_retry_base_delay_ms {
@@ -554,7 +824,14 @@ impl AppConfig {
         };
 
         let webhook_retry_base_delay_ms: u64 = match webhook_retry_base_delay_ms_raw.parse() {
-            Ok(v) if v > 0 => v,
+            Ok(v) if v > 0 && v <= MAX_TIMEOUT_MS => v,
+            Ok(v) if v > 0 => {
+                errors.push(format!(
+                    "WEBHOOK_RETRY_BASE_DELAY_MS ({}) exceeds maximum {}",
+                    v, MAX_TIMEOUT_MS
+                ));
+                200
+            }
             Ok(_) => {
                 errors.push("WEBHOOK_RETRY_BASE_DELAY_MS must be greater than 0".to_string());
                 200
@@ -569,7 +846,14 @@ impl AppConfig {
         };
 
         let webhook_retry_max_delay_ms: u64 = match webhook_retry_max_delay_ms_raw.parse() {
-            Ok(v) if v > 0 => v,
+            Ok(v) if v > 0 && v <= MAX_TIMEOUT_MS => v,
+            Ok(v) if v > 0 => {
+                errors.push(format!(
+                    "WEBHOOK_RETRY_MAX_DELAY_MS ({}) exceeds maximum {}",
+                    v, MAX_TIMEOUT_MS
+                ));
+                30_000
+            }
             Ok(_) => {
                 errors.push("WEBHOOK_RETRY_MAX_DELAY_MS must be greater than 0".to_string());
                 30_000
@@ -584,7 +868,14 @@ impl AppConfig {
         };
 
         let webhook_request_timeout_ms: u64 = match webhook_request_timeout_ms_raw.parse() {
-            Ok(v) if v > 0 => v,
+            Ok(v) if v > 0 && v <= MAX_TIMEOUT_MS => v,
+            Ok(v) if v > 0 => {
+                errors.push(format!(
+                    "WEBHOOK_REQUEST_TIMEOUT_MS ({}) exceeds maximum {}",
+                    v, MAX_TIMEOUT_MS
+                ));
+                10_000
+            }
             Ok(_) => {
                 errors.push("WEBHOOK_REQUEST_TIMEOUT_MS must be greater than 0".to_string());
                 10_000
@@ -622,7 +913,7 @@ impl AppConfig {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|url| {
-                if Url::parse(url).is_err() {
+                if ValidatedUrl::parse(url).is_err() {
                     errors.push(format!("WEBHOOK_URLS must contain valid URLs, got '{}'", url));
                 }
                 url.to_string()
@@ -674,6 +965,28 @@ impl AppConfig {
             cache_config_ttl,
             cache_events_ttl,
         })
+    }
+
+    /// Reload configuration from environment variables, returning a new instance.
+    /// Useful in combination with the hot-reload mechanism to apply changes at runtime.
+    pub fn reload_from_env(&self, metrics: Option<Arc<MetricsRegistry>>) -> Result<Self, ConfigError> {
+        Self::from_env_with_metrics(metrics)
+    }
+
+    /// Returns the current configuration schema version.
+    pub fn version() -> u32 {
+        CONFIG_VERSION
+    }
+
+    /// Validate a config for rollback safety by checking version compatibility.
+    pub fn validate_compatible(&self, previous_version: u32) -> Result<(), ConfigError> {
+        if previous_version > CONFIG_VERSION {
+            return Err(ConfigError::Validation(format!(
+                "cannot roll back from config version {} to current version {}",
+                previous_version, CONFIG_VERSION
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -799,11 +1112,12 @@ mod tests {
         let err = AppConfig::from_env().expect_err("config should fail");
         let msg = err.to_string();
 
-        assert!(msg.contains("PORT must be between 1 and 65535"));
-        assert!(msg.contains("STELLAR_HORIZON_URL must be a valid URL"));
-        assert!(msg.contains("REDIS_URL must be a valid redis:// or rediss:// URL"));
+        assert!(msg.contains("port 0 is below minimum 1") || msg.contains("PORT must be a valid u16"));
+        assert!(msg.contains("STELLAR_HORIZON_URL must be a valid http/https URL") || msg.contains("invalid URL"));
+        assert!(msg.contains("REDIS_URL must be a valid redis:// or rediss:// URL") || msg.contains("invalid Redis URL"));
         assert!(msg.contains("RATE_LIMIT_PER_SECOND must be greater than 0"));
         assert!(msg.contains("RATE_LIMIT_BURST must be greater than 0"));
+        assert!(msg.contains("RATE_LIMIT_BURST") && msg.contains("must be >="));
         assert!(msg.contains("STELLAR_RETRY_BASE_DELAY_MS must be greater than 0"));
         assert!(msg.contains(
             "STELLAR_RETRY_MAX_DELAY_MS must be greater than or equal to STELLAR_RETRY_BASE_DELAY_MS"
@@ -937,5 +1251,146 @@ mod tests {
 
         let output = metrics.render();
         assert!(output.contains("config_reload_total"));
+    }
+
+    // ── New validation tests ─────────────────────────────────────────────
+
+    #[test]
+    fn rejects_burst_less_than_per_second() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        env::set_var("STELLAR_SECRET_KEY", VALID_KEY);
+        env::set_var("RATE_LIMIT_PER_SECOND", "100");
+        env::set_var("RATE_LIMIT_BURST", "50"); // burst < rps
+
+        let err = AppConfig::from_env().expect_err("should fail");
+        assert!(err.to_string().contains("RATE_LIMIT_BURST (50) must be >= RATE_LIMIT_PER_SECOND (100)"));
+    }
+
+    #[test]
+    fn rejects_per_issuer_burst_less_than_per_second() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        env::set_var("STELLAR_SECRET_KEY", VALID_KEY);
+        env::set_var("RATE_LIMIT_PER_SECOND", "1000");
+        env::set_var("PER_ISSUER_RATE_LIMIT_PER_SECOND", "20");
+        env::set_var("PER_ISSUER_RATE_LIMIT_BURST", "10"); // burst < rps
+
+        let err = AppConfig::from_env().expect_err("should fail");
+        assert!(err.to_string().contains("PER_ISSUER_RATE_LIMIT_BURST (10) must be >= PER_ISSUER_RATE_LIMIT_PER_SECOND (20)"));
+    }
+
+    #[test]
+    fn rejects_invalid_log_level() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        env::set_var("STELLAR_SECRET_KEY", VALID_KEY);
+        env::set_var("LOG_LEVEL", "invalid");
+
+        let err = AppConfig::from_env().expect_err("should fail");
+        assert!(err.to_string().contains("LOG_LEVEL must be one of"));
+    }
+
+    #[test]
+    fn rejects_stellar_retry_delay_exceeding_max() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        env::set_var("STELLAR_SECRET_KEY", VALID_KEY);
+        env::set_var("STELLAR_RETRY_BASE_DELAY_MS", "999999");
+
+        let err = AppConfig::from_env().expect_err("should fail");
+        assert!(err.to_string().contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn validated_url_rejects_invalid_scheme() {
+        assert!(ValidatedUrl::parse("ftp://example.com").is_err());
+        assert!(ValidatedUrl::parse("https://example.com").is_ok());
+        assert!(ValidatedUrl::parse("http://localhost:8080").is_ok());
+    }
+
+    #[test]
+    fn validated_redis_url_rejects_non_redis_scheme() {
+        assert!(ValidatedRedisUrl::parse("https://example.com").is_err());
+        assert!(ValidatedRedisUrl::parse("redis://localhost:6379").is_ok());
+        assert!(ValidatedRedisUrl::parse("rediss://localhost:6380").is_ok());
+    }
+
+    #[test]
+    fn validated_port_rejects_out_of_range() {
+        assert!(ValidatedPort::new(0).is_err());
+        // u16::MAX is the maximum valid value, so we test via `new` which takes u16
+        // Testing exact boundary: 65535 is valid
+        assert!(ValidatedPort::new(65535).is_ok());
+        assert!(ValidatedPort::new(8080).is_ok());
+    }
+
+    #[test]
+    fn validated_port_roundtrip() {
+        let port = ValidatedPort::new(3000).unwrap();
+        assert_eq!(port.value(), 3000);
+        let val: u16 = port.into();
+        assert_eq!(val, 3000);
+    }
+
+    #[test]
+    fn config_version_validation() {
+        assert!(ConfigVersion::new(0).is_err());
+        assert!(ConfigVersion::new(1).is_ok());
+        assert!(ConfigVersion::new(CONFIG_VERSION + 1).is_err());
+        assert_eq!(ConfigVersion::current().value(), CONFIG_VERSION);
+    }
+
+    #[test]
+    fn config_channel_creates_watcher() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        env::set_var("STELLAR_SECRET_KEY", VALID_KEY);
+        let config = AppConfig::from_env().unwrap();
+        let (tx, mut rx) = config_channel(config.clone()).unwrap();
+        let received = rx.borrow_and_update().clone();
+        assert_eq!(received.config.port, config.port);
+        assert_eq!(received.version.value(), CONFIG_VERSION);
+        // tx can send updates
+        let update = ConfigUpdate::new(config).unwrap();
+        tx.send(update).unwrap();
+    }
+
+    #[test]
+    fn validate_compatible_rejects_rollback() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        env::set_var("STELLAR_SECRET_KEY", VALID_KEY);
+        let config = AppConfig::from_env().unwrap();
+        let result = config.validate_compatible(CONFIG_VERSION + 1);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("roll back"));
+    }
+
+    #[test]
+    fn validate_compatible_accepts_same_version() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        env::set_var("STELLAR_SECRET_KEY", VALID_KEY);
+        let config = AppConfig::from_env().unwrap();
+        assert!(config.validate_compatible(CONFIG_VERSION).is_ok());
+    }
+
+    #[test]
+    fn reload_from_env_produces_new_instance() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        env::set_var("STELLAR_SECRET_KEY", VALID_KEY);
+        let config = AppConfig::from_env().unwrap();
+        assert_eq!(config.port, 8080);
+
+        env::set_var("PORT", "9090");
+        let reloaded = config.reload_from_env(None).unwrap();
+        assert_eq!(reloaded.port, 9090);
+    }
+
+    #[test]
+    fn config_version_constant_is_consistent() {
+        assert_eq!(CONFIG_VERSION, 1);
     }
 }
