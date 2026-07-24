@@ -92,18 +92,20 @@ mod native {
     /// `POST /config/reload` — triggers a config reload from environment variables.
     async fn config_reload_handler(State(state): State<AppState>) -> impl IntoResponse {
         match AppConfig::from_env_with_metrics(Some(Arc::clone(&state.metrics))) {
-            Ok(new_config) => {
-                match ConfigUpdate::new(new_config) {
-                    Ok(update) => {
-                        if state.config_watcher.send(update).is_ok() {
-                            Json(json!({"status": "ok", "message": "config reload triggered successfully"}))
-                        } else {
-                            Json(json!({"status": "error", "message": "no subscribers for config update"}))
-                        }
+            Ok(new_config) => match ConfigUpdate::new(new_config) {
+                Ok(update) => {
+                    if state.config_watcher.send(update).is_ok() {
+                        Json(
+                            json!({"status": "ok", "message": "config reload triggered successfully"}),
+                        )
+                    } else {
+                        Json(
+                            json!({"status": "error", "message": "no subscribers for config update"}),
+                        )
                     }
-                    Err(e) => Json(json!({"status": "error", "message": e.to_string()})),
                 }
-            }
+                Err(e) => Json(json!({"status": "error", "message": e.to_string()})),
+            },
             Err(e) => Json(json!({"status": "error", "message": e.to_string()})),
         }
     }
@@ -150,14 +152,12 @@ mod native {
                     }
                 ))
             }
-            CacheBackend::Redis(_) => {
-                Json(json!(
-                    {
-                        "backend": "redis",
-                        "message": "Redis cache statistics not yet implemented"
-                    }
-                ))
-            }
+            CacheBackend::Redis(_) => Json(json!(
+                {
+                    "backend": "redis",
+                    "message": "Redis cache statistics not yet implemented"
+                }
+            )),
         }
     }
 
@@ -170,7 +170,10 @@ mod native {
         let config = AppConfig::from_env_with_metrics(Some(Arc::clone(&metrics)))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        eprintln!("[proofstell] Configuration v{} loaded successfully", AppConfig::version());
+        eprintln!(
+            "[proofstell] Configuration v{} loaded successfully",
+            AppConfig::version()
+        );
         eprintln!("[proofstell]   port:               {}", config.port);
         eprintln!(
             "[proofstell]   stellar_horizon_url: {}",
@@ -188,8 +191,7 @@ mod native {
         );
         eprintln!(
             "[proofstell]   cache:              backend={}, max_size={}",
-            config.cache_backend,
-            config.cache_max_size
+            config.cache_backend, config.cache_max_size
         );
 
         // ── Create config hot-reload channel ─────────────────────────
@@ -214,7 +216,10 @@ mod native {
                 }
             }
             _ => {
-                eprintln!("[proofstell] Initializing InMemory cache backend (max_size={})", config.cache_max_size);
+                eprintln!(
+                    "[proofstell] Initializing InMemory cache backend (max_size={})",
+                    config.cache_max_size
+                );
                 let cache = InMemoryCache::with_max_size(config.cache_max_size)
                     .with_metrics(Arc::clone(&metrics));
                 Arc::new(CacheBackend::InMemory(cache))

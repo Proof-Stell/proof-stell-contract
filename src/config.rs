@@ -1,6 +1,11 @@
-use std::{env, fmt, string::{String, ToString}, sync::Arc, vec::Vec};
-use thiserror::Error;
+use std::{
+    env, fmt,
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 use stellar_strkey::ed25519::PrivateKey;
+use thiserror::Error;
 
 use crate::metrics::MetricsRegistry;
 
@@ -12,6 +17,9 @@ const DEFAULT_STELLAR_REQUEST_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_STELLAR_CIRCUIT_BREAKER_FAILURE_THRESHOLD: u32 = 5;
 const DEFAULT_STELLAR_CIRCUIT_BREAKER_OPEN_DURATION_MS: u64 = 30_000;
 const DEFAULT_STELLAR_CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS: u32 = 1;
+const DEFAULT_STELLAR_RETRY_JITTER_TYPE: &str = "full";
+const DEFAULT_STELLAR_BULKHEAD_MAX_CONCURRENT: u32 = 10;
+const DEFAULT_STELLAR_BULKHEAD_MAX_QUEUE: u32 = 100;
 
 /// Current configuration schema version.
 /// Increment this when adding or removing fields that break backward compatibility.
@@ -38,9 +46,8 @@ pub struct ValidatedUrl(url::Url);
 
 impl ValidatedUrl {
     pub fn parse(input: &str) -> Result<Self, ConfigError> {
-        let url = url::Url::parse(input).map_err(|_| {
-            ConfigError::Validation(format!("invalid URL: '{}'", input))
-        })?;
+        let url = url::Url::parse(input)
+            .map_err(|_| ConfigError::Validation(format!("invalid URL: '{}'", input)))?;
         if url.scheme() != "http" && url.scheme() != "https" {
             return Err(ConfigError::Validation(format!(
                 "URL must use http or https scheme, got '{}' in '{}'",
@@ -72,9 +79,8 @@ pub struct ValidatedRedisUrl(url::Url);
 
 impl ValidatedRedisUrl {
     pub fn parse(input: &str) -> Result<Self, ConfigError> {
-        let url = url::Url::parse(input).map_err(|_| {
-            ConfigError::Validation(format!("invalid Redis URL: '{}'", input))
-        })?;
+        let url = url::Url::parse(input)
+            .map_err(|_| ConfigError::Validation(format!("invalid Redis URL: '{}'", input)))?;
         if url.scheme() != "redis" && url.scheme() != "rediss" {
             return Err(ConfigError::Validation(format!(
                 "REDIS_URL must use redis:// or rediss:// scheme, got '{}'",
@@ -176,7 +182,9 @@ impl ConfigUpdate {
 pub type ConfigWatcher = std::sync::Arc<tokio::sync::watch::Sender<ConfigUpdate>>;
 
 /// Create a new hot-reload channel with the given initial config.
-pub fn config_channel(initial: AppConfig) -> Result<(ConfigWatcher, tokio::sync::watch::Receiver<ConfigUpdate>), ConfigError> {
+pub fn config_channel(
+    initial: AppConfig,
+) -> Result<(ConfigWatcher, tokio::sync::watch::Receiver<ConfigUpdate>), ConfigError> {
     let update = ConfigUpdate::new(initial)?;
     let (tx, rx) = tokio::sync::watch::channel(update);
     Ok((std::sync::Arc::new(tx), rx))
@@ -221,6 +229,9 @@ pub struct AppConfig {
     pub stellar_circuit_breaker_failure_threshold: u32,
     pub stellar_circuit_breaker_open_duration_ms: u64,
     pub stellar_circuit_breaker_half_open_max_calls: u32,
+    pub stellar_retry_jitter_type: String,
+    pub stellar_bulkhead_max_concurrent: u32,
+    pub stellar_bulkhead_max_queue: u32,
     pub log_level: String,
     pub webhook_urls: Vec<String>,
     pub webhook_secret: Option<String>,
@@ -250,20 +261,35 @@ impl fmt::Debug for AppConfig {
             .field("redis_url", &self.redis_url)
             .field("rate_limit_per_second", &self.rate_limit_per_second)
             .field("rate_limit_burst", &self.rate_limit_burst)
-            .field("per_issuer_rate_limit_per_second", &self.per_issuer_rate_limit_per_second)
-            .field("per_issuer_rate_limit_burst", &self.per_issuer_rate_limit_burst)
-            .field("issuer_rate_limit_ttl_seconds", &self.issuer_rate_limit_ttl_seconds)
+            .field(
+                "per_issuer_rate_limit_per_second",
+                &self.per_issuer_rate_limit_per_second,
+            )
+            .field(
+                "per_issuer_rate_limit_burst",
+                &self.per_issuer_rate_limit_burst,
+            )
+            .field(
+                "issuer_rate_limit_ttl_seconds",
+                &self.issuer_rate_limit_ttl_seconds,
+            )
             .field("stellar_max_retries", &self.stellar_max_retries)
             .field(
                 "stellar_retry_base_delay_ms",
                 &self.stellar_retry_base_delay_ms,
             )
-            .field("stellar_retry_max_delay_ms", &self.stellar_retry_max_delay_ms)
+            .field(
+                "stellar_retry_max_delay_ms",
+                &self.stellar_retry_max_delay_ms,
+            )
             .field(
                 "stellar_retry_jitter_enabled",
                 &self.stellar_retry_jitter_enabled,
             )
-            .field("stellar_request_timeout_ms", &self.stellar_request_timeout_ms)
+            .field(
+                "stellar_request_timeout_ms",
+                &self.stellar_request_timeout_ms,
+            )
             .field(
                 "stellar_circuit_breaker_failure_threshold",
                 &self.stellar_circuit_breaker_failure_threshold,
@@ -276,6 +302,15 @@ impl fmt::Debug for AppConfig {
                 "stellar_circuit_breaker_half_open_max_calls",
                 &self.stellar_circuit_breaker_half_open_max_calls,
             )
+            .field("stellar_retry_jitter_type", &self.stellar_retry_jitter_type)
+            .field(
+                "stellar_bulkhead_max_concurrent",
+                &self.stellar_bulkhead_max_concurrent,
+            )
+            .field(
+                "stellar_bulkhead_max_queue",
+                &self.stellar_bulkhead_max_queue,
+            )
             .field("log_level", &self.log_level)
             .field("webhook_urls", &self.webhook_urls)
             .field(
@@ -283,9 +318,18 @@ impl fmt::Debug for AppConfig {
                 &self.webhook_secret.as_deref().map(|_| "<redacted>"),
             )
             .field("webhook_max_retries", &self.webhook_max_retries)
-            .field("webhook_retry_base_delay_ms", &self.webhook_retry_base_delay_ms)
-            .field("webhook_retry_max_delay_ms", &self.webhook_retry_max_delay_ms)
-            .field("webhook_request_timeout_ms", &self.webhook_request_timeout_ms)
+            .field(
+                "webhook_retry_base_delay_ms",
+                &self.webhook_retry_base_delay_ms,
+            )
+            .field(
+                "webhook_retry_max_delay_ms",
+                &self.webhook_retry_max_delay_ms,
+            )
+            .field(
+                "webhook_request_timeout_ms",
+                &self.webhook_request_timeout_ms,
+            )
             .field("webhook_jitter_enabled", &self.webhook_jitter_enabled)
             .field("cache_verification_ttl", &self.cache_verification_ttl)
             .field("cache_backend", &self.cache_backend)
@@ -322,7 +366,7 @@ impl AppConfig {
 
         // ── Environment variable documentation ──────────────────────────
         // Each variable is documented with its purpose, default, and validation rules.
-        // 
+        //
         // NETWORK:
         //   PORT                    - HTTP listen port (1-65535, default: 8080)
         //   LOG_LEVEL               - Logging level (default: "info")
@@ -376,8 +420,7 @@ impl AppConfig {
             Ok(key) => {
                 if PrivateKey::from_string(&key).is_err() {
                     errors.push(
-                        "STELLAR_SECRET_KEY must be a valid Stellar ed25519 secret key"
-                            .to_string(),
+                        "STELLAR_SECRET_KEY must be a valid Stellar ed25519 secret key".to_string(),
                     );
                 }
                 Some(key)
@@ -443,6 +486,18 @@ impl AppConfig {
             "STELLAR_CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS",
             &DEFAULT_STELLAR_CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS.to_string(),
         );
+        let stellar_retry_jitter_type_raw = get_env_or_default(
+            "STELLAR_RETRY_JITTER_TYPE",
+            DEFAULT_STELLAR_RETRY_JITTER_TYPE,
+        );
+        let stellar_bulkhead_max_concurrent_raw = get_env_or_default(
+            "STELLAR_BULKHEAD_MAX_CONCURRENT",
+            &DEFAULT_STELLAR_BULKHEAD_MAX_CONCURRENT.to_string(),
+        );
+        let stellar_bulkhead_max_queue_raw = get_env_or_default(
+            "STELLAR_BULKHEAD_MAX_QUEUE",
+            &DEFAULT_STELLAR_BULKHEAD_MAX_QUEUE.to_string(),
+        );
         let cache_verification_ttl_raw = get_env_or_default("CACHE_VERIFICATION_TTL", "3600");
         let cache_backend_raw = get_env_or_default("CACHE_BACKEND", "inmemory");
         let cache_max_size_raw = get_env_or_default("CACHE_MAX_SIZE", "10000");
@@ -459,7 +514,10 @@ impl AppConfig {
                 }
             },
             Err(_) => {
-                errors.push(format!("PORT must be a valid u16 (1-65535), got '{}'", port_raw));
+                errors.push(format!(
+                    "PORT must be a valid u16 (1-65535), got '{}'",
+                    port_raw
+                ));
                 8080
             }
         };
@@ -521,9 +579,7 @@ impl AppConfig {
         let per_issuer_rate_limit_per_second: u32 = match per_issuer_rps_raw.parse() {
             Ok(v) if v > 0 => v,
             Ok(_) => {
-                errors.push(
-                    "PER_ISSUER_RATE_LIMIT_PER_SECOND must be greater than 0".to_string(),
-                );
+                errors.push("PER_ISSUER_RATE_LIMIT_PER_SECOND must be greater than 0".to_string());
                 10
             }
             Err(_) => {
@@ -538,9 +594,7 @@ impl AppConfig {
         let per_issuer_rate_limit_burst: u32 = match per_issuer_burst_raw.parse() {
             Ok(v) if v > 0 => v,
             Ok(_) => {
-                errors.push(
-                    "PER_ISSUER_RATE_LIMIT_BURST must be greater than 0".to_string(),
-                );
+                errors.push("PER_ISSUER_RATE_LIMIT_BURST must be greater than 0".to_string());
                 per_issuer_rate_limit_per_second * 2
             }
             Err(_) => {
@@ -570,9 +624,7 @@ impl AppConfig {
         let issuer_rate_limit_ttl_seconds: u64 = match issuer_ttl_raw.parse() {
             Ok(v) if v > 0 => v,
             Ok(_) => {
-                errors.push(
-                    "ISSUER_RATE_LIMIT_TTL_SECONDS must be greater than 0".to_string(),
-                );
+                errors.push("ISSUER_RATE_LIMIT_TTL_SECONDS must be greater than 0".to_string());
                 3600
             }
             Err(_) => {
@@ -737,6 +789,48 @@ impl AppConfig {
                     DEFAULT_STELLAR_CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS
                 }
             };
+        let stellar_retry_jitter_type = match stellar_retry_jitter_type_raw.to_lowercase().as_str()
+        {
+            "none" | "full" | "equal" | "decorrelated" => stellar_retry_jitter_type_raw.to_string(),
+            other => {
+                errors.push(format!(
+                    "STELLAR_RETRY_JITTER_TYPE must be one of: none, full, equal, decorrelated; got '{}'",
+                    other
+                ));
+                DEFAULT_STELLAR_RETRY_JITTER_TYPE.to_string()
+            }
+        };
+
+        let stellar_bulkhead_max_concurrent: u32 = match stellar_bulkhead_max_concurrent_raw.parse()
+        {
+            Ok(v) if v > 0 => v,
+            Ok(_) => {
+                errors.push("STELLAR_BULKHEAD_MAX_CONCURRENT must be greater than 0".to_string());
+                DEFAULT_STELLAR_BULKHEAD_MAX_CONCURRENT
+            }
+            Err(_) => {
+                errors.push(format!(
+                    "STELLAR_BULKHEAD_MAX_CONCURRENT must be a valid u32, got '{}'",
+                    stellar_bulkhead_max_concurrent_raw
+                ));
+                DEFAULT_STELLAR_BULKHEAD_MAX_CONCURRENT
+            }
+        };
+
+        let stellar_bulkhead_max_queue: u32 = match stellar_bulkhead_max_queue_raw.parse() {
+            Ok(v) if v > 0 => v,
+            Ok(_) => {
+                errors.push("STELLAR_BULKHEAD_MAX_QUEUE must be greater than 0".to_string());
+                DEFAULT_STELLAR_BULKHEAD_MAX_QUEUE
+            }
+            Err(_) => {
+                errors.push(format!(
+                    "STELLAR_BULKHEAD_MAX_QUEUE must be a valid u32, got '{}'",
+                    stellar_bulkhead_max_queue_raw
+                ));
+                DEFAULT_STELLAR_BULKHEAD_MAX_QUEUE
+            }
+        };
 
         let cache_verification_ttl: u64 = match cache_verification_ttl_raw.parse() {
             Ok(v) => v,
@@ -914,7 +1008,10 @@ impl AppConfig {
             .filter(|s| !s.is_empty())
             .map(|url| {
                 if ValidatedUrl::parse(url).is_err() {
-                    errors.push(format!("WEBHOOK_URLS must contain valid URLs, got '{}'", url));
+                    errors.push(format!(
+                        "WEBHOOK_URLS must contain valid URLs, got '{}'",
+                        url
+                    ));
                 }
                 url.to_string()
             })
@@ -951,6 +1048,9 @@ impl AppConfig {
             stellar_circuit_breaker_failure_threshold,
             stellar_circuit_breaker_open_duration_ms,
             stellar_circuit_breaker_half_open_max_calls,
+            stellar_retry_jitter_type,
+            stellar_bulkhead_max_concurrent,
+            stellar_bulkhead_max_queue,
             log_level,
             webhook_urls,
             webhook_secret,
@@ -969,7 +1069,10 @@ impl AppConfig {
 
     /// Reload configuration from environment variables, returning a new instance.
     /// Useful in combination with the hot-reload mechanism to apply changes at runtime.
-    pub fn reload_from_env(&self, metrics: Option<Arc<MetricsRegistry>>) -> Result<Self, ConfigError> {
+    pub fn reload_from_env(
+        &self,
+        metrics: Option<Arc<MetricsRegistry>>,
+    ) -> Result<Self, ConfigError> {
         Self::from_env_with_metrics(metrics)
     }
 
@@ -1016,6 +1119,9 @@ mod tests {
             "STELLAR_CIRCUIT_BREAKER_FAILURE_THRESHOLD",
             "STELLAR_CIRCUIT_BREAKER_OPEN_DURATION_MS",
             "STELLAR_CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS",
+            "STELLAR_RETRY_JITTER_TYPE",
+            "STELLAR_BULKHEAD_MAX_CONCURRENT",
+            "STELLAR_BULKHEAD_MAX_QUEUE",
             "LOG_LEVEL",
             "WEBHOOK_URLS",
             "WEBHOOK_SECRET",
@@ -1045,7 +1151,10 @@ mod tests {
         let cfg = AppConfig::from_env().expect("config should load with defaults");
 
         assert_eq!(cfg.port, 8080);
-        assert_eq!(cfg.stellar_horizon_url, "https://horizon-testnet.stellar.org");
+        assert_eq!(
+            cfg.stellar_horizon_url,
+            "https://horizon-testnet.stellar.org"
+        );
         assert_eq!(cfg.redis_url, "redis://127.0.0.1:6379");
         assert_eq!(cfg.rate_limit_per_second, 100);
         assert_eq!(cfg.per_issuer_rate_limit_per_second, 10);
@@ -1060,6 +1169,9 @@ mod tests {
         assert_eq!(cfg.stellar_circuit_breaker_failure_threshold, 5);
         assert_eq!(cfg.stellar_circuit_breaker_open_duration_ms, 30_000);
         assert_eq!(cfg.stellar_circuit_breaker_half_open_max_calls, 1);
+        assert_eq!(cfg.stellar_retry_jitter_type, "full");
+        assert_eq!(cfg.stellar_bulkhead_max_concurrent, 10);
+        assert_eq!(cfg.stellar_bulkhead_max_queue, 100);
     }
 
     #[test]
@@ -1112,9 +1224,17 @@ mod tests {
         let err = AppConfig::from_env().expect_err("config should fail");
         let msg = err.to_string();
 
-        assert!(msg.contains("port 0 is below minimum 1") || msg.contains("PORT must be a valid u16"));
-        assert!(msg.contains("STELLAR_HORIZON_URL must be a valid http/https URL") || msg.contains("invalid URL"));
-        assert!(msg.contains("REDIS_URL must be a valid redis:// or rediss:// URL") || msg.contains("invalid Redis URL"));
+        assert!(
+            msg.contains("port 0 is below minimum 1") || msg.contains("PORT must be a valid u16")
+        );
+        assert!(
+            msg.contains("STELLAR_HORIZON_URL must be a valid http/https URL")
+                || msg.contains("invalid URL")
+        );
+        assert!(
+            msg.contains("REDIS_URL must be a valid redis:// or rediss:// URL")
+                || msg.contains("invalid Redis URL")
+        );
         assert!(msg.contains("RATE_LIMIT_PER_SECOND must be greater than 0"));
         assert!(msg.contains("RATE_LIMIT_BURST must be greater than 0"));
         assert!(msg.contains("RATE_LIMIT_BURST") && msg.contains("must be >="));
@@ -1203,6 +1323,9 @@ mod tests {
             stellar_circuit_breaker_failure_threshold: 5,
             stellar_circuit_breaker_open_duration_ms: 30_000,
             stellar_circuit_breaker_half_open_max_calls: 1,
+            stellar_retry_jitter_type: "full".to_string(),
+            stellar_bulkhead_max_concurrent: 10,
+            stellar_bulkhead_max_queue: 100,
             log_level: "info".to_string(),
             webhook_urls: vec!["https://webhook.example.com".to_string()],
             webhook_secret: Some("another-secret".to_string()),
@@ -1246,8 +1369,8 @@ mod tests {
         env::set_var("STELLAR_SECRET_KEY", VALID_KEY);
 
         let metrics = MetricsRegistry::arc();
-        let _cfg = AppConfig::from_env_with_metrics(Some(Arc::clone(&metrics)))
-            .expect("should succeed");
+        let _cfg =
+            AppConfig::from_env_with_metrics(Some(Arc::clone(&metrics))).expect("should succeed");
 
         let output = metrics.render();
         assert!(output.contains("config_reload_total"));
@@ -1264,7 +1387,9 @@ mod tests {
         env::set_var("RATE_LIMIT_BURST", "50"); // burst < rps
 
         let err = AppConfig::from_env().expect_err("should fail");
-        assert!(err.to_string().contains("RATE_LIMIT_BURST (50) must be >= RATE_LIMIT_PER_SECOND (100)"));
+        assert!(err
+            .to_string()
+            .contains("RATE_LIMIT_BURST (50) must be >= RATE_LIMIT_PER_SECOND (100)"));
     }
 
     #[test]
@@ -1277,7 +1402,9 @@ mod tests {
         env::set_var("PER_ISSUER_RATE_LIMIT_BURST", "10"); // burst < rps
 
         let err = AppConfig::from_env().expect_err("should fail");
-        assert!(err.to_string().contains("PER_ISSUER_RATE_LIMIT_BURST (10) must be >= PER_ISSUER_RATE_LIMIT_PER_SECOND (20)"));
+        assert!(err.to_string().contains(
+            "PER_ISSUER_RATE_LIMIT_BURST (10) must be >= PER_ISSUER_RATE_LIMIT_PER_SECOND (20)"
+        ));
     }
 
     #[test]

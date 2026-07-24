@@ -4,7 +4,12 @@ use governor::{
     state::keyed::DefaultKeyedStateStore,
     Quota, RateLimiter,
 };
-use std::{num::NonZeroU32, string::{String, ToString}, sync::Arc, time::Duration};
+use std::{
+    num::NonZeroU32,
+    string::{String, ToString},
+    sync::Arc,
+    time::Duration,
+};
 
 use crate::{cache::CacheKey, metrics::MetricsRegistry};
 
@@ -18,18 +23,11 @@ fn now_secs() -> u64 {
 // ── Type aliases ─────────────────────────────────────────────────────────────
 
 /// Global (unkeyed) rate limiter backed by the Quanta monotonic clock.
-pub type GlobalRateLimiter = RateLimiter<
-    governor::state::NotKeyed,
-    governor::state::InMemoryState,
-    QuantaClock,
->;
+pub type GlobalRateLimiter =
+    RateLimiter<governor::state::NotKeyed, governor::state::InMemoryState, QuantaClock>;
 
 /// Per-issuer (keyed) rate limiter backed by the Quanta monotonic clock.
-pub type KeyedRateLimiterInner = RateLimiter<
-    String,
-    DefaultKeyedStateStore<String>,
-    QuantaClock,
->;
+pub type KeyedRateLimiterInner = RateLimiter<String, DefaultKeyedStateStore<String>, QuantaClock>;
 
 // ── Rate limit status ─────────────────────────────────────────────────────────
 
@@ -243,7 +241,8 @@ impl PerIssuerRateLimiter {
     /// Call this periodically (e.g. from a background task) to bound memory use.
     pub fn evict_stale(&self) {
         let cutoff = now_secs().saturating_sub(self.config.issuer_ttl_seconds);
-        self.issuer_meta.retain(|_, entry| entry.last_seen >= cutoff);
+        self.issuer_meta
+            .retain(|_, entry| entry.last_seen >= cutoff);
     }
 
     /// Return the number of tracked issuers currently in the metadata map.
@@ -330,7 +329,10 @@ impl std::fmt::Display for RateLimitError {
                 "global rate limit exceeded; retry after {}s",
                 retry_after.as_secs()
             ),
-            Self::IssuerExhausted { issuer, retry_after } => write!(
+            Self::IssuerExhausted {
+                issuer,
+                retry_after,
+            } => write!(
                 f,
                 "per-issuer rate limit exceeded for '{}'; retry after {}s",
                 issuer,

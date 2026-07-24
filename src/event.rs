@@ -62,11 +62,7 @@ impl ContractEventContext {
     pub fn idempotency_key(&self, aggregate_id: &str, event_type: &str) -> String {
         format!(
             "contract:{}:{}:{}:{}:{}",
-            self.transaction_hash,
-            self.ledger_sequence,
-            self.event_index,
-            aggregate_id,
-            event_type
+            self.transaction_hash, self.ledger_sequence, self.event_index, aggregate_id, event_type
         )
     }
 
@@ -235,10 +231,7 @@ impl EventIngestor {
         }
     }
 
-    pub fn with_metrics(
-        mut self,
-        metrics: Arc<crate::metrics::MetricsRegistry>,
-    ) -> Self {
+    pub fn with_metrics(mut self, metrics: Arc<crate::metrics::MetricsRegistry>) -> Self {
         self.metrics = Some(metrics);
         self
     }
@@ -484,9 +477,7 @@ mod tests {
         )
         .expect_err("context should fail validation");
 
-        assert!(err
-            .to_string()
-            .contains("invalid contract event context"));
+        assert!(err.to_string().contains("invalid contract event context"));
     }
 
     #[test]
@@ -678,7 +669,10 @@ mod store_tests {
 
         assert_eq!(store.count("doc-1"), 1);
         assert_eq!(store.count("doc-2"), 1);
-        assert_eq!(store.get_history("doc-1").unwrap()[0].event_type, EVENT_DOCUMENT_REGISTERED);
+        assert_eq!(
+            store.get_history("doc-1").unwrap()[0].event_type,
+            EVENT_DOCUMENT_REGISTERED
+        );
         assert_eq!(
             store.get_history("doc-2").unwrap()[0].event_type,
             EVENT_DOCUMENT_OWNER_CHANGED

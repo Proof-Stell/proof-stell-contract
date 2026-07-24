@@ -55,8 +55,14 @@ pub const STELLAR_MEMO_HASH_BYTES: usize = 32;
 /// completed; see [`HashValidator::validate_with_length_constant_time`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum ValidationError {
-    WrongLength { expected: usize, actual: usize },
-    InvalidCharacter { position: usize, character: char },
+    WrongLength {
+        expected: usize,
+        actual: usize,
+    },
+    InvalidCharacter {
+        position: usize,
+        character: char,
+    },
     EmptyHash,
     /// Hash algorithm is not supported for contract submission (only SHA-256 is accepted).
     UnsupportedAlgorithm,
@@ -72,17 +78,31 @@ impl fmt::Display for ValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ValidationError::WrongLength { expected, actual } => {
-                write!(f, "hash length {} does not match expected {}", actual, expected)
+                write!(
+                    f,
+                    "hash length {} does not match expected {}",
+                    actual, expected
+                )
             }
-            ValidationError::InvalidCharacter { position, character } => {
-                write!(f, "invalid character '{}' at position {}", character, position)
+            ValidationError::InvalidCharacter {
+                position,
+                character,
+            } => {
+                write!(
+                    f,
+                    "invalid character '{}' at position {}",
+                    character, position
+                )
             }
             ValidationError::EmptyHash => write!(f, "hash cannot be empty"),
             ValidationError::UnsupportedAlgorithm => {
                 write!(f, "hash algorithm not supported for contract submission")
             }
             ValidationError::NotCanonical => {
-                write!(f, "hash is not in canonical form (must be lowercase hex without whitespace)")
+                write!(
+                    f,
+                    "hash is not in canonical form (must be lowercase hex without whitespace)"
+                )
             }
             ValidationError::InvalidStellarMemoFormat => {
                 write!(f, "hash does not match Stellar memo format requirements")
@@ -161,9 +181,7 @@ impl CanonicalHash {
         // whitespace issue; any other length composed of valid hex is a length
         // error.
         if !is_canonical_shape(hash) {
-            let all_hex = hash
-                .bytes()
-                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+            let all_hex = hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
             if all_hex {
                 return Err(ValidationError::WrongLength {
                     expected: HashAlgorithm::SHA256.hex_length(),
@@ -300,7 +318,12 @@ impl HashRegistry {
         // on the first match.
         let mut seen = false;
         for existing in self.inner.iter() {
-            if existing.key().as_bytes().ct_eq(hash.as_str().as_bytes()).into() {
+            if existing
+                .key()
+                .as_bytes()
+                .ct_eq(hash.as_str().as_bytes())
+                .into()
+            {
                 seen = true;
             }
         }
@@ -318,7 +341,12 @@ impl HashRegistry {
     pub fn contains(&self, hash: &CanonicalHash) -> bool {
         let mut found = false;
         for existing in self.inner.iter() {
-            if existing.key().as_bytes().ct_eq(hash.as_str().as_bytes()).into() {
+            if existing
+                .key()
+                .as_bytes()
+                .ct_eq(hash.as_str().as_bytes())
+                .into()
+            {
                 found = true;
             }
         }
@@ -595,7 +623,9 @@ fn is_canonical_shape_with_len(hash: &str, len: usize) -> bool {
     if bytes.len() != len {
         return false;
     }
-    bytes.iter().all(|&b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    bytes
+        .iter()
+        .all(|&b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Canonical shape for the contract algorithm (SHA-256, 64 chars).
@@ -853,7 +883,11 @@ mod tests {
 
     #[test]
     fn canonical_hash_from_bytes() {
-        let bytes = [0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55];
+        let bytes = [
+            0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f,
+            0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b,
+            0x78, 0x52, 0xb8, 0x55,
+        ];
         let hash = CanonicalHash::from_bytes(&bytes);
         assert_eq!(hash.as_str(), sample_sha256());
     }
@@ -993,7 +1027,10 @@ mod tests {
 
     #[test]
     fn is_canonical_detects_valid_hash() {
-        assert!(HashValidator::is_canonical(sample_sha256(), HashAlgorithm::SHA256));
+        assert!(HashValidator::is_canonical(
+            sample_sha256(),
+            HashAlgorithm::SHA256
+        ));
     }
 
     #[test]
@@ -1004,7 +1041,10 @@ mod tests {
 
     #[test]
     fn is_canonical_rejects_wrong_length() {
-        assert!(!HashValidator::is_canonical("abc123", HashAlgorithm::SHA256));
+        assert!(!HashValidator::is_canonical(
+            "abc123",
+            HashAlgorithm::SHA256
+        ));
     }
 
     // ── HashAlgorithm methods ───────────────────────────────────────────
@@ -1025,7 +1065,10 @@ mod tests {
 
     #[test]
     fn validation_error_display_wrong_length() {
-        let err = ValidationError::WrongLength { expected: 64, actual: 63 };
+        let err = ValidationError::WrongLength {
+            expected: 64,
+            actual: 63,
+        };
         let msg = format!("{}", err);
         assert!(msg.contains("63"));
         assert!(msg.contains("64"));
@@ -1033,7 +1076,10 @@ mod tests {
 
     #[test]
     fn validation_error_display_invalid_character() {
-        let err = ValidationError::InvalidCharacter { position: 10, character: 'g' };
+        let err = ValidationError::InvalidCharacter {
+            position: 10,
+            character: 'g',
+        };
         let msg = format!("{}", err);
         assert!(msg.contains("10"));
         assert!(msg.contains("g"));

@@ -224,7 +224,7 @@ impl HealthCheckState {
         self.is_healthy = false;
         self.last_check = Some(SystemTime::now());
         self.consecutive_failures += 1;
-        
+
         // Exponential backoff: 2^failures seconds, capped at 60s
         let backoff_secs = (2u64.pow(self.consecutive_failures.min(6))).min(60);
         self.backoff_until = Some(SystemTime::now() + Duration::from_secs(backoff_secs));
@@ -249,12 +249,12 @@ impl RedisCache {
 
     async fn check_connection(&self) -> bool {
         let mut state = self.health_check_state.lock().await;
-        
+
         // Return cached healthy status if we're not due for a check
         if !state.should_check() {
             return state.is_healthy;
         }
-        
+
         // Perform health check
         let result = {
             let mut conn = self.connection.clone();
@@ -263,13 +263,13 @@ impl RedisCache {
                 .await
                 .is_ok()
         };
-        
+
         if result {
             state.record_success();
         } else {
             state.record_failure();
         }
-        
+
         result
     }
 
@@ -278,7 +278,7 @@ impl RedisCache {
         if !self.check_connection().await {
             return Err(anyhow::anyhow!("Redis connection is unhealthy"));
         }
-        
+
         let mut conn = self.connection.clone();
         let value: Option<String> = conn.get(key).await?;
         Ok(value)
@@ -289,7 +289,7 @@ impl RedisCache {
         if !self.check_connection().await {
             return Err(anyhow::anyhow!("Redis connection is unhealthy"));
         }
-        
+
         let mut conn = self.connection.clone();
         conn.set_ex::<_, _, ()>(key, value, ttl).await?;
         Ok(())
@@ -300,7 +300,7 @@ impl RedisCache {
         if !self.check_connection().await {
             return Err(anyhow::anyhow!("Redis connection is unhealthy"));
         }
-        
+
         let mut conn = self.connection.clone();
         conn.del::<_, ()>(key).await?;
         Ok(())
@@ -430,7 +430,7 @@ impl InMemoryCache {
         let mut store = self.store.write().await;
         let mut lru_queue = self.lru_queue.write().await;
         let mut stats = self.stats.write().await;
-        
+
         let mut loaded = 0;
         for (key, value, ttl) in entries {
             store.insert(
@@ -444,7 +444,7 @@ impl InMemoryCache {
             lru_queue.push_front(key);
             loaded += 1;
         }
-        
+
         // Evict if over limit
         if self.max_size > 0 {
             while store.len() > self.max_size {
@@ -456,7 +456,7 @@ impl InMemoryCache {
                 }
             }
         }
-        
+
         Ok(loaded)
     }
 
@@ -473,14 +473,14 @@ impl InMemoryCache {
             current_size: store.len(),
             max_size: self.max_size,
         };
-        
+
         // Update Prometheus metrics if available
         if let Some(ref metrics) = self.metrics {
             metrics.set_cache_size(snapshot.current_size as u64);
             metrics.set_cache_hit_rate(snapshot.hit_rate);
             metrics.increment_cache_evictions_by(stats.evictions);
         }
-        
+
         snapshot
     }
 
@@ -489,20 +489,20 @@ impl InMemoryCache {
         let mut store = self.store.write().await;
         let mut lru_queue = self.lru_queue.write().await;
         let mut stats = self.stats.write().await;
-        
+
         let mut results = Vec::with_capacity(keys.len());
         let now = now_secs();
-        
+
         for key in keys {
             match store.get(key) {
                 Some(entry) if entry.expires_at > now => {
                     // Valid entry
                     results.push((key.clone(), Some(entry.value.clone())));
-                    
+
                     // Update LRU
                     lru_queue.retain(|k| k != key);
                     lru_queue.push_front(key.clone());
-                    
+
                     stats.hits += 1;
                 }
                 Some(_) => {
@@ -518,7 +518,7 @@ impl InMemoryCache {
                 }
             }
         }
-        
+
         Ok(results)
     }
 
@@ -527,7 +527,7 @@ impl InMemoryCache {
         let mut store = self.store.write().await;
         let mut lru_queue = self.lru_queue.write().await;
         let mut stats = self.stats.write().await;
-        
+
         for (key, value, ttl) in &entries {
             store.insert(
                 key.clone(),
@@ -539,7 +539,7 @@ impl InMemoryCache {
             lru_queue.retain(|k| k != key);
             lru_queue.push_front(key.clone());
         }
-        
+
         // Evict if over limit
         if self.max_size > 0 {
             while store.len() > self.max_size {
@@ -551,7 +551,7 @@ impl InMemoryCache {
                 }
             }
         }
-        
+
         Ok(entries.len())
     }
 
@@ -571,16 +571,16 @@ impl InMemoryCache {
         let mut store = self.store.write().await;
         let mut lru_queue = self.lru_queue.write().await;
         let mut stats = self.stats.write().await;
-        
+
         match store.get(key) {
             Some(entry) if entry.expires_at > now_secs() => {
                 // Entry is valid - clone value while holding lock
                 let value = entry.value.clone();
-                
+
                 // Update LRU: move to front (most recently used)
                 lru_queue.retain(|k| k != key);
                 lru_queue.push_front(key.clone());
-                
+
                 stats.hits += 1;
                 Ok((Some(value), false))
             }
@@ -589,10 +589,10 @@ impl InMemoryCache {
                 store.remove(key);
                 lru_queue.retain(|k| k != key);
                 stats.expired += 1;
-                
+
                 // Broadcast expiration event
                 let _ = self.event_tx.send(CacheEvent::Expired { key: key.clone() });
-                
+
                 Ok((None, true))
             }
             None => {
@@ -611,9 +611,9 @@ impl InMemoryCache {
     async fn set_raw(&self, key: &CacheKey, value: &str, ttl: u64) -> Result<()> {
         let mut store = self.store.write().await;
         let mut lru_queue = self.lru_queue.write().await;
-        
-        let is_update = store.contains_key(key);
-        
+
+        let _is_update = store.contains_key(key);
+
         // Insert or update entry
         store.insert(
             key.clone(),
@@ -622,15 +622,15 @@ impl InMemoryCache {
                 expires_at: now_secs().saturating_add(ttl),
             },
         );
-        
+
         // Update LRU: move to front (most recently used)
         lru_queue.retain(|k| k != key);
         lru_queue.push_front(key.clone());
-        
+
         // Broadcast update event for any set (create or update) so subscribers
         // always receive the latest state change.
         let _ = self.event_tx.send(CacheEvent::Updated { key: key.clone() });
-        
+
         // Evict entries if over max_size
         if self.max_size > 0 {
             let mut stats = self.stats.write().await;
@@ -638,15 +638,17 @@ impl InMemoryCache {
                 if let Some(lru_key) = lru_queue.pop_back() {
                     store.remove(&lru_key);
                     stats.evictions += 1;
-                    
+
                     // Broadcast eviction event
-                    let _ = self.event_tx.send(CacheEvent::Evicted { key: lru_key.clone() });
+                    let _ = self.event_tx.send(CacheEvent::Evicted {
+                        key: lru_key.clone(),
+                    });
                 } else {
                     break;
                 }
             }
         }
-        
+
         Ok(())
     }
 
@@ -655,11 +657,11 @@ impl InMemoryCache {
         let mut lru_queue = self.lru_queue.write().await;
         let existed = store.remove(key).is_some();
         lru_queue.retain(|k| k != key);
-        
+
         if existed {
             let _ = self.event_tx.send(CacheEvent::Deleted { key: key.clone() });
         }
-        
+
         Ok(())
     }
 
@@ -691,10 +693,9 @@ impl InMemoryCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::StreamExt;
     use std::time::Duration;
-    use tokio::time::sleep;
     use tokio::sync::broadcast::error::TryRecvError;
+    use tokio::time::sleep;
 
     #[tokio::test]
     async fn in_memory_cache_returns_value_within_ttl() {
@@ -735,10 +736,7 @@ mod tests {
         let cache = CacheBackend::InMemory(InMemoryCache::new());
         let v_key = CacheKey::Verification("same".to_string());
         let c_key = CacheKey::Config("same".to_string());
-        cache
-            .set_raw(&v_key, "verification_val", 60)
-            .await
-            .unwrap();
+        cache.set_raw(&v_key, "verification_val", 60).await.unwrap();
         cache.set_raw(&c_key, "config_val", 60).await.unwrap();
         assert_eq!(
             cache.get_raw(&v_key).await.unwrap(),
@@ -841,8 +839,14 @@ mod tests {
 
         cache.set_raw(&v_key, "verification_val", 60).await.unwrap();
         cache.set_raw(&e_key, "events_val", 60).await.unwrap();
-        assert_eq!(cache.get_raw(&v_key).await.unwrap(), Some("verification_val".to_string()));
-        assert_eq!(cache.get_raw(&e_key).await.unwrap(), Some("events_val".to_string()));
+        assert_eq!(
+            cache.get_raw(&v_key).await.unwrap(),
+            Some("verification_val".to_string())
+        );
+        assert_eq!(
+            cache.get_raw(&e_key).await.unwrap(),
+            Some("events_val".to_string())
+        );
     }
 
     #[tokio::test]
@@ -878,7 +882,10 @@ mod tests {
             let cache_clone = Arc::clone(&cache);
             let key = CacheKey::Verification(format!("concurrent_write_{}", i));
             handles.push(tokio::spawn(async move {
-                cache_clone.set_raw(&key, &format!("value_{}", i), 60).await.unwrap();
+                cache_clone
+                    .set_raw(&key, &format!("value_{}", i), 60)
+                    .await
+                    .unwrap();
                 cache_clone.get_raw(&key).await.unwrap()
             }));
         }
@@ -901,7 +908,10 @@ mod tests {
             let backend_clone = Arc::clone(&backend);
             let key = CacheKey::Verification(format!("lru_{}", i));
             handles.push(tokio::spawn(async move {
-                backend_clone.set_raw(&key, &format!("value_{}", i), 60).await.unwrap();
+                backend_clone
+                    .set_raw(&key, &format!("value_{}", i), 60)
+                    .await
+                    .unwrap();
             }));
         }
 
@@ -928,7 +938,14 @@ mod tests {
 
         // Concurrent hits
         // Ensure the key exists so these are hits, not misses.
-        backend.set_raw(&CacheKey::Verification("metric_concurrent".to_string()), "value", 60).await.unwrap();
+        backend
+            .set_raw(
+                &CacheKey::Verification("metric_concurrent".to_string()),
+                "value",
+                60,
+            )
+            .await
+            .unwrap();
         for _ in 0..50 {
             let backend_clone = Arc::clone(&backend);
             let key = CacheKey::Verification("metric_concurrent".to_string());
@@ -984,13 +1001,13 @@ mod tests {
     async fn redis_health_check_prevents_concurrent_checks() {
         // This test verifies the health check backoff mechanism
         let cache = RedisCache::new("redis://127.0.0.1:6379").await;
-        
+
         // If Redis is not available, this will fail gracefully
         if cache.is_err() {
             // Skip test if Redis is not available
             return;
         }
-        
+
         let cache = cache.unwrap();
         let cache = Arc::new(cache);
         let mut handles = vec![];
@@ -998,9 +1015,9 @@ mod tests {
         // Trigger concurrent health checks
         for _ in 0..10 {
             let cache_clone = Arc::clone(&cache);
-            handles.push(tokio::spawn(async move {
-                cache_clone.check_connection().await
-            }));
+            handles.push(tokio::spawn(
+                async move { cache_clone.check_connection().await },
+            ));
         }
 
         let results: Vec<_> = futures::future::join_all(handles).await;
@@ -1014,31 +1031,67 @@ mod tests {
     async fn cache_warming_preloads_entries() {
         let cache = InMemoryCache::new();
         let entries = vec![
-            (CacheKey::Verification("warm1".to_string()), "value1".to_string(), 60),
-            (CacheKey::Verification("warm2".to_string()), "value2".to_string(), 60),
-            (CacheKey::Verification("warm3".to_string()), "value3".to_string(), 60),
+            (
+                CacheKey::Verification("warm1".to_string()),
+                "value1".to_string(),
+                60,
+            ),
+            (
+                CacheKey::Verification("warm2".to_string()),
+                "value2".to_string(),
+                60,
+            ),
+            (
+                CacheKey::Verification("warm3".to_string()),
+                "value3".to_string(),
+                60,
+            ),
         ];
-        
+
         let loaded = cache.warm(entries).await.unwrap();
         assert_eq!(loaded, 3);
-        
+
         // Verify entries are accessible
         let backend = CacheBackend::InMemory(cache);
-        assert_eq!(backend.get_raw(&CacheKey::Verification("warm1".to_string())).await.unwrap(), Some("value1".to_string()));
-        assert_eq!(backend.get_raw(&CacheKey::Verification("warm2".to_string())).await.unwrap(), Some("value2".to_string()));
-        assert_eq!(backend.get_raw(&CacheKey::Verification("warm3".to_string())).await.unwrap(), Some("value3".to_string()));
+        assert_eq!(
+            backend
+                .get_raw(&CacheKey::Verification("warm1".to_string()))
+                .await
+                .unwrap(),
+            Some("value1".to_string())
+        );
+        assert_eq!(
+            backend
+                .get_raw(&CacheKey::Verification("warm2".to_string()))
+                .await
+                .unwrap(),
+            Some("value2".to_string())
+        );
+        assert_eq!(
+            backend
+                .get_raw(&CacheKey::Verification("warm3".to_string()))
+                .await
+                .unwrap(),
+            Some("value3".to_string())
+        );
     }
 
     #[tokio::test]
     async fn cache_warming_respects_max_size() {
         let cache = InMemoryCache::with_max_size(5);
-        let entries: Vec<_> = (0..10).map(|i| {
-            (CacheKey::Verification(format!("warm_{}", i)), format!("value_{}", i), 60)
-        }).collect();
-        
+        let entries: Vec<_> = (0..10)
+            .map(|i| {
+                (
+                    CacheKey::Verification(format!("warm_{}", i)),
+                    format!("value_{}", i),
+                    60,
+                )
+            })
+            .collect();
+
         let loaded = cache.warm(entries).await.unwrap();
         assert_eq!(loaded, 10);
-        
+
         // Verify only 5 entries remain
         let stats = cache.stats().await;
         assert_eq!(stats.current_size, 5);
@@ -1048,20 +1101,32 @@ mod tests {
     async fn cache_stats_track_operations() {
         let cache = InMemoryCache::new();
         let backend = CacheBackend::InMemory(cache);
-        
+
         // Miss
-        backend.get_raw(&CacheKey::Verification("miss".to_string())).await.unwrap();
-        
+        backend
+            .get_raw(&CacheKey::Verification("miss".to_string()))
+            .await
+            .unwrap();
+
         // Set and hit
-        backend.set_raw(&CacheKey::Verification("hit".to_string()), "value", 60).await.unwrap();
-        backend.get_raw(&CacheKey::Verification("hit".to_string())).await.unwrap();
-        backend.get_raw(&CacheKey::Verification("hit".to_string())).await.unwrap();
-        
+        backend
+            .set_raw(&CacheKey::Verification("hit".to_string()), "value", 60)
+            .await
+            .unwrap();
+        backend
+            .get_raw(&CacheKey::Verification("hit".to_string()))
+            .await
+            .unwrap();
+        backend
+            .get_raw(&CacheKey::Verification("hit".to_string()))
+            .await
+            .unwrap();
+
         let cache = match backend {
             CacheBackend::InMemory(c) => c,
             _ => std::panic!("Expected InMemoryCache"),
         };
-        
+
         let stats = cache.stats().await;
         assert_eq!(stats.hits, 2);
         assert_eq!(stats.misses, 1);
@@ -1072,17 +1137,24 @@ mod tests {
     async fn cache_stats_track_evictions() {
         let cache = InMemoryCache::with_max_size(3);
         let backend = CacheBackend::InMemory(cache);
-        
+
         // Add 5 entries (should evict 2)
         for i in 0..5 {
-            backend.set_raw(&CacheKey::Verification(format!("evict_{}", i)), &format!("value_{}", i), 60).await.unwrap();
+            backend
+                .set_raw(
+                    &CacheKey::Verification(format!("evict_{}", i)),
+                    &format!("value_{}", i),
+                    60,
+                )
+                .await
+                .unwrap();
         }
-        
+
         let cache = match backend {
             CacheBackend::InMemory(c) => c,
             _ => std::panic!("Expected InMemoryCache"),
         };
-        
+
         let stats = cache.stats().await;
         assert_eq!(stats.evictions, 2);
         assert_eq!(stats.current_size, 3);
@@ -1092,23 +1164,32 @@ mod tests {
     async fn batch_get_retrieves_multiple_keys() {
         let cache = InMemoryCache::new();
         let backend = CacheBackend::InMemory(cache);
-        
-        backend.set_raw(&CacheKey::Verification("key1".to_string()), "value1", 60).await.unwrap();
-        backend.set_raw(&CacheKey::Verification("key2".to_string()), "value2", 60).await.unwrap();
-        backend.set_raw(&CacheKey::Verification("key3".to_string()), "value3", 60).await.unwrap();
-        
+
+        backend
+            .set_raw(&CacheKey::Verification("key1".to_string()), "value1", 60)
+            .await
+            .unwrap();
+        backend
+            .set_raw(&CacheKey::Verification("key2".to_string()), "value2", 60)
+            .await
+            .unwrap();
+        backend
+            .set_raw(&CacheKey::Verification("key3".to_string()), "value3", 60)
+            .await
+            .unwrap();
+
         let cache = match backend {
             CacheBackend::InMemory(c) => c,
             _ => std::panic!("Expected InMemoryCache"),
         };
-        
+
         let keys = vec![
             CacheKey::Verification("key1".to_string()),
             CacheKey::Verification("key2".to_string()),
             CacheKey::Verification("key3".to_string()),
             CacheKey::Verification("key4".to_string()), // miss
         ];
-        
+
         let results = cache.get_batch(&keys).await.unwrap();
         assert_eq!(results.len(), 4);
         assert_eq!(results[0].1, Some("value1".to_string()));
@@ -1121,14 +1202,26 @@ mod tests {
     async fn batch_set_stores_multiple_keys() {
         let cache = InMemoryCache::new();
         let entries = vec![
-            (CacheKey::Verification("batch1".to_string()), "value1".to_string(), 60),
-            (CacheKey::Verification("batch2".to_string()), "value2".to_string(), 60),
-            (CacheKey::Verification("batch3".to_string()), "value3".to_string(), 60),
+            (
+                CacheKey::Verification("batch1".to_string()),
+                "value1".to_string(),
+                60,
+            ),
+            (
+                CacheKey::Verification("batch2".to_string()),
+                "value2".to_string(),
+                60,
+            ),
+            (
+                CacheKey::Verification("batch3".to_string()),
+                "value3".to_string(),
+                60,
+            ),
         ];
-        
+
         let count = cache.set_batch(entries).await.unwrap();
         assert_eq!(count, 3);
-        
+
         let stats = cache.stats().await;
         assert_eq!(stats.current_size, 3);
     }
@@ -1137,25 +1230,42 @@ mod tests {
     async fn event_driven_invalidation_broadcasts_events() {
         let cache = InMemoryCache::new();
         let mut rx = cache.subscribe();
-        
+
         // Set a key
-        cache.set_raw(&CacheKey::Verification("event_key".to_string()), "value", 60).await.unwrap();
-        
+        cache
+            .set_raw(
+                &CacheKey::Verification("event_key".to_string()),
+                "value",
+                60,
+            )
+            .await
+            .unwrap();
+
         // Update it
-        cache.set_raw(&CacheKey::Verification("event_key".to_string()), "new_value", 60).await.unwrap();
-        
+        cache
+            .set_raw(
+                &CacheKey::Verification("event_key".to_string()),
+                "new_value",
+                60,
+            )
+            .await
+            .unwrap();
+
         // Delete it
-        cache.delete(&CacheKey::Verification("event_key".to_string())).await.unwrap();
-        
+        cache
+            .delete(&CacheKey::Verification("event_key".to_string()))
+            .await
+            .unwrap();
+
         // Check events with timeout
         let event1 = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
         assert!(event1.is_ok());
         matches!(event1.unwrap().unwrap(), CacheEvent::Updated { .. });
-        
+
         let event2 = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
         assert!(event2.is_ok());
         matches!(event2.unwrap().unwrap(), CacheEvent::Updated { .. });
-        
+
         let event3 = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
         assert!(event3.is_ok());
         matches!(event3.unwrap().unwrap(), CacheEvent::Deleted { .. });
@@ -1165,8 +1275,15 @@ mod tests {
     async fn event_broadcasts_on_expiry() {
         let cache = InMemoryCache::new();
         let mut rx = cache.subscribe();
-        
-        cache.set_raw(&CacheKey::Verification("expire_key".to_string()), "value", 1).await.unwrap();
+
+        cache
+            .set_raw(
+                &CacheKey::Verification("expire_key".to_string()),
+                "value",
+                1,
+            )
+            .await
+            .unwrap();
         // Drain any prior events (e.g., initial Updated from set)
         loop {
             match rx.try_recv() {
@@ -1179,7 +1296,10 @@ mod tests {
         sleep(Duration::from_secs(2)).await;
 
         // Trigger expiry check
-        cache.get_raw(&CacheKey::Verification("expire_key".to_string())).await.unwrap();
+        cache
+            .get_raw(&CacheKey::Verification("expire_key".to_string()))
+            .await
+            .unwrap();
 
         // Check for expiration event
         let event = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
@@ -1196,9 +1316,18 @@ mod tests {
         let cache = InMemoryCache::with_max_size(2);
         let mut rx = cache.subscribe();
         // Perform sets that should trigger eviction
-        cache.set_raw(&CacheKey::Verification("evict1".to_string()), "value1", 60).await.unwrap();
-        cache.set_raw(&CacheKey::Verification("evict2".to_string()), "value2", 60).await.unwrap();
-        cache.set_raw(&CacheKey::Verification("evict3".to_string()), "value3", 60).await.unwrap();
+        cache
+            .set_raw(&CacheKey::Verification("evict1".to_string()), "value1", 60)
+            .await
+            .unwrap();
+        cache
+            .set_raw(&CacheKey::Verification("evict2".to_string()), "value2", 60)
+            .await
+            .unwrap();
+        cache
+            .set_raw(&CacheKey::Verification("evict3".to_string()), "value3", 60)
+            .await
+            .unwrap();
 
         // Consume events until we see an Evicted event or timeout
         let deadline = std::time::Instant::now() + Duration::from_millis(500);
@@ -1222,14 +1351,20 @@ mod tests {
         let cache = InMemoryCache::new();
         let mut rx1 = cache.subscribe();
         let mut rx2 = cache.subscribe();
-        
-        cache.set_raw(&CacheKey::Verification("multi".to_string()), "value", 60).await.unwrap();
-        cache.delete(&CacheKey::Verification("multi".to_string())).await.unwrap();
-        
+
+        cache
+            .set_raw(&CacheKey::Verification("multi".to_string()), "value", 60)
+            .await
+            .unwrap();
+        cache
+            .delete(&CacheKey::Verification("multi".to_string()))
+            .await
+            .unwrap();
+
         // Both subscribers should receive events
         let event1 = tokio::time::timeout(Duration::from_millis(100), rx1.recv()).await;
         let event2 = tokio::time::timeout(Duration::from_millis(100), rx2.recv()).await;
-        
+
         assert!(event1.is_ok());
         assert!(event2.is_ok());
     }

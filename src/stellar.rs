@@ -1,18 +1,25 @@
 use anyhow::Result;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::{
     boxed::Box,
     fmt,
     future::Future,
     string::{String, ToString},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
     vec::Vec,
 };
 use thiserror::Error;
+use tokio::sync::Semaphore as AsyncSemaphore;
 
 use crate::{
-    cache::{CacheBackend, CacheKey}, config::AppConfig, hash_validator::CanonicalHash,
+    cache::{CacheBackend, CacheKey},
+    config::AppConfig,
+    hash_validator::CanonicalHash,
 };
 
 use crate::metrics::MetricsRegistry;
@@ -33,6 +40,7 @@ pub struct StellarClient {
     metrics: Option<Arc<MetricsRegistry>>,
     config: StellarClientConfig,
     cache: Option<Arc<CacheBackend>>,
+    bulkhead: Arc<AsyncSemaphore>,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +50,8 @@ pub struct StellarClientConfig {
     pub request_timeout: Duration,
     pub rate_limit_per_second: u32,
     pub rate_limit_burst: u32,
+    pub bulkhead: BulkheadConfig,
+    pub graceful_degradation: GracefulDegradationConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +66,8 @@ pub struct RetryPolicy {
 pub enum RetryJitter {
     None,
     Full,
+    Equal,
+    Decorrelated,
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +75,36 @@ pub struct CircuitBreakerConfig {
     pub failure_threshold: u32,
     pub open_duration: Duration,
     pub half_open_max_calls: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct BulkheadConfig {
+    pub max_concurrent: u32,
+    pub max_queue: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct GracefulDegradationConfig {
+    pub fallback_cache_ttl: Duration,
+    pub stale_cache_ok: bool,
+}
+
+impl Default for BulkheadConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent: 10,
+            max_queue: 100,
+        }
+    }
+}
+
+impl Default for GracefulDegradationConfig {
+    fn default() -> Self {
+        Self {
+            fallback_cache_ttl: Duration::from_secs(300),
+            stale_cache_ok: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +123,10 @@ pub struct CircuitBreakerMetrics {
     pub rejected_calls: u64,
     pub successful_calls: u64,
     pub failed_calls: u64,
+    pub timeout_calls: u64,
+    pub retryable_http_calls: u64,
+    pub consecutive_failures: u32,
+    pub in_flight: u32,
 }
 
 #[derive(Debug, Error)]
@@ -208,6 +254,7 @@ impl StellarClient {
             circuit_breaker: Arc::new(CircuitBreaker::new(config.circuit_breaker.clone())),
             max_retries: config.retry.max_retries,
             metrics: None,
+            bulkhead: Arc::new(AsyncSemaphore::new(config.bulkhead.max_concurrent as usize)),
             config,
             cache: None,
         }
@@ -235,7 +282,10 @@ impl StellarClient {
 
     /// Warm the cache with pre-known verification results.
     /// This is useful for loading frequently accessed hashes at startup.
-    pub async fn warm_cache(&self, entries: Vec<(String, VerificationResult, u64)>) -> Result<usize> {
+    pub async fn warm_cache(
+        &self,
+        entries: Vec<(String, VerificationResult, u64)>,
+    ) -> Result<usize> {
         if let Some(cache) = &self.cache {
             if let CacheBackend::InMemory(inmem) = cache.as_ref() {
                 let cache_entries: Vec<_> = entries
@@ -246,7 +296,7 @@ impl StellarClient {
                         (key, value, ttl)
                     })
                     .collect();
-                
+
                 inmem.warm(cache_entries).await
             } else {
                 Ok(0) // Redis warming not implemented yet
@@ -326,7 +376,10 @@ impl StellarClient {
             .await
     }
 
-    async fn execute_verify_hash_with_retry(&self, hash: &str) -> StellarResult<VerificationResult> {
+    async fn execute_verify_hash_with_retry(
+        &self,
+        hash: &str,
+    ) -> StellarResult<VerificationResult> {
         let result = self.verify_hash(hash).await;
         match result.status {
             VerificationStatus::ConfirmedMatch | VerificationStatus::NoMatch => Ok(result),
@@ -349,18 +402,17 @@ impl StellarClient {
     }
 
     fn retry_delay(&self, attempt: u32) -> Duration {
+        let base = self.config.retry.base_delay;
+        let max_delay = self.config.retry.max_delay;
         let multiplier = 2_u32.saturating_pow(attempt.min(31));
-        let exponential = self
-            .config
-            .retry
-            .base_delay
-            .checked_mul(multiplier)
-            .unwrap_or(self.config.retry.max_delay);
-        let capped = exponential.min(self.config.retry.max_delay);
+        let exponential = base.checked_mul(multiplier).unwrap_or(max_delay);
+        let capped = exponential.min(max_delay);
 
         match self.config.retry.jitter {
             RetryJitter::None => capped,
-            RetryJitter::Full => jittered_delay(capped),
+            RetryJitter::Full => jittered_delay_full(capped),
+            RetryJitter::Equal => jittered_delay_equal(capped),
+            RetryJitter::Decorrelated => jittered_delay_decorrelated(capped, attempt),
         }
     }
 
@@ -403,11 +455,25 @@ impl StellarClient {
                 if let Some(ref m) = self.metrics {
                     m.increment_retry();
                 }
-                tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
+                tokio::time::sleep(self.retry_delay(attempt - 1)).await;
             }
 
             let horizon_start = MetricsRegistry::start_timer();
             let url = format!("{}/transactions?memo={}", self.horizon_url, hash);
+
+            let bulkhead_acquired =
+                tokio::time::timeout(Duration::from_millis(500), self.bulkhead.acquire())
+                    .await
+                    .is_ok();
+
+            if !bulkhead_acquired {
+                if let Some(fallback) = self.try_stale_cache_fallback(hash).await {
+                    return fallback;
+                }
+                last_status = VerificationStatus::NetworkError;
+                continue;
+            }
+
             let resp_result = self.http_client.get(&url).send().await;
 
             match resp_result {
@@ -467,7 +533,7 @@ impl StellarClient {
                         m.record_horizon_latency("error", horizon_latency);
                     }
                     last_status = VerificationStatus::NetworkError;
-                    // Network error — continue retry
+                    last_http_status = None;
                 }
             }
         }
@@ -558,6 +624,16 @@ impl StellarClient {
         Ok(None)
     }
 
+    async fn try_stale_cache_fallback(&self, hash: &str) -> Option<VerificationResult> {
+        let cache = self.cache.as_ref()?;
+        let key = CacheKey::verification(hash);
+        let result = cache.get::<VerificationResult>(&key).await.ok()??;
+        if result.verified() || self.config.graceful_degradation.stale_cache_ok {
+            return Some(result);
+        }
+        None
+    }
+
     pub async fn anchor_transfer(&self, _transfer_hash: &str, _memo: &str) -> Result<()> {
         if let Some(ref m) = self.metrics {
             m.increment_request_count();
@@ -573,20 +649,29 @@ impl StellarClientConfig {
                 max_retries: config.stellar_max_retries,
                 base_delay: Duration::from_millis(config.stellar_retry_base_delay_ms),
                 max_delay: Duration::from_millis(config.stellar_retry_max_delay_ms),
-                jitter: if config.stellar_retry_jitter_enabled {
-                    RetryJitter::Full
-                } else {
-                    RetryJitter::None
+                jitter: match config.stellar_retry_jitter_type.to_lowercase().as_str() {
+                    "none" => RetryJitter::None,
+                    "full" => RetryJitter::Full,
+                    "equal" => RetryJitter::Equal,
+                    "decorrelated" => RetryJitter::Decorrelated,
+                    _ => RetryJitter::Full,
                 },
             },
             circuit_breaker: CircuitBreakerConfig {
                 failure_threshold: config.stellar_circuit_breaker_failure_threshold,
-                open_duration: Duration::from_millis(config.stellar_circuit_breaker_open_duration_ms),
+                open_duration: Duration::from_millis(
+                    config.stellar_circuit_breaker_open_duration_ms,
+                ),
                 half_open_max_calls: config.stellar_circuit_breaker_half_open_max_calls,
             },
             request_timeout: Duration::from_millis(config.stellar_request_timeout_ms),
             rate_limit_per_second: config.rate_limit_per_second,
             rate_limit_burst: config.rate_limit_burst,
+            bulkhead: BulkheadConfig {
+                max_concurrent: config.stellar_bulkhead_max_concurrent,
+                max_queue: config.stellar_bulkhead_max_queue,
+            },
+            graceful_degradation: GracefulDegradationConfig::default(),
         }
     }
 }
@@ -608,6 +693,8 @@ impl Default for StellarClientConfig {
             request_timeout: Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS),
             rate_limit_per_second: 10,
             rate_limit_burst: 10,
+            bulkhead: BulkheadConfig::default(),
+            graceful_degradation: GracefulDegradationConfig::default(),
         }
     }
 }
@@ -631,8 +718,7 @@ impl StellarError {
             | Self::RetryableHttpStatus { .. }
             | Self::ResponseParse { .. } => true,
             Self::RetryExhausted { final_error, .. } => final_error.is_retryable(),
-            Self::NonRetryableHttpStatus { .. }
-            | Self::VerificationNotFound { .. } => false,
+            Self::NonRetryableHttpStatus { .. } | Self::VerificationNotFound { .. } => false,
         }
     }
 
@@ -648,29 +734,37 @@ impl StellarError {
 #[derive(Debug)]
 struct CircuitBreaker {
     config: CircuitBreakerConfig,
-    state: Mutex<CircuitState>,
+    state: AtomicUsize,
     opened_at: Mutex<Option<Instant>>,
-    consecutive_failures: Mutex<u32>,
-    half_open_in_flight: Mutex<u32>,
-    half_open_successes: Mutex<u32>,
+    consecutive_failures: AtomicUsize,
+    half_open_in_flight: AtomicUsize,
+    half_open_successes: AtomicUsize,
+    half_open_semaphore: Arc<AsyncSemaphore>,
     metrics: Mutex<CircuitBreakerMetrics>,
 }
 
 impl CircuitBreaker {
     fn new(config: CircuitBreakerConfig) -> Self {
+        let max_calls = config.half_open_max_calls.max(1) as usize;
         Self {
             config,
-            state: Mutex::new(CircuitState::Closed),
+            state: AtomicUsize::new(CircuitState::Closed as usize),
             opened_at: Mutex::new(None),
-            consecutive_failures: Mutex::new(0),
-            half_open_in_flight: Mutex::new(0),
-            half_open_successes: Mutex::new(0),
+            consecutive_failures: AtomicUsize::new(0),
+            half_open_in_flight: AtomicUsize::new(0),
+            half_open_successes: AtomicUsize::new(0),
+            half_open_semaphore: Arc::new(AsyncSemaphore::new(max_calls)),
             metrics: Mutex::new(CircuitBreakerMetrics::default()),
         }
     }
 
     fn state(&self) -> CircuitState {
-        *self.state.lock().unwrap()
+        match self.state.load(Ordering::Relaxed) {
+            0 => CircuitState::Closed,
+            1 => CircuitState::Open,
+            2 => CircuitState::HalfOpen,
+            _ => CircuitState::Closed,
+        }
     }
 
     fn metrics(&self) -> CircuitBreakerMetrics {
@@ -682,131 +776,152 @@ impl CircuitBreaker {
         F: FnOnce() -> Fut,
         Fut: Future<Output = StellarResult<T>>,
     {
-        self.allow_call()?;
+        self.allow_call().await?;
         let result = operation().await;
-        self.record_result(&result);
+        self.record_result(&result).await;
         result
     }
 
-    fn allow_call(&self) -> StellarResult<()> {
-        let mut state = self.state.lock().unwrap();
-
-        match *state {
-            CircuitState::Closed => Ok(()),
-            CircuitState::Open => {
-                let opened_at = *self.opened_at.lock().unwrap();
-                if let Some(opened_at) = opened_at {
-                    let elapsed = opened_at.elapsed();
-                    if elapsed >= self.config.open_duration {
-                        *state = CircuitState::HalfOpen;
-                        *self.half_open_in_flight.lock().unwrap() = 0;
-                        *self.half_open_successes.lock().unwrap() = 0;
+    async fn allow_call(&self) -> StellarResult<()> {
+        loop {
+            let current = self.state.load(Ordering::Relaxed);
+            match current {
+                s if s == (CircuitState::Closed as usize) => return Ok(()),
+                s if s == (CircuitState::Open as usize) => {
+                    let opened_at = *self.opened_at.lock().unwrap();
+                    if let Some(opened_at) = opened_at {
+                        let elapsed = opened_at.elapsed();
+                        if elapsed >= self.config.open_duration {
+                            let expected = CircuitState::HalfOpen as usize;
+                            if self
+                                .state
+                                .compare_exchange(
+                                    current,
+                                    expected,
+                                    Ordering::Relaxed,
+                                    Ordering::Relaxed,
+                                )
+                                .is_ok()
+                            {
+                                self.half_open_in_flight.store(0, Ordering::Relaxed);
+                                self.half_open_successes.store(0, Ordering::Relaxed);
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                        let retry_after = self.config.open_duration.saturating_sub(elapsed);
+                        self.increment_rejected_calls();
+                        return Err(StellarError::CircuitOpen {
+                            state: CircuitState::Open,
+                            retry_after,
+                        });
+                    }
+                    let expected = CircuitState::HalfOpen as usize;
+                    if self
+                        .state
+                        .compare_exchange(current, expected, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        self.half_open_in_flight.store(0, Ordering::Relaxed);
+                        self.half_open_successes.store(0, Ordering::Relaxed);
                         return Ok(());
                     }
-
-                    let retry_after = self.config.open_duration.saturating_sub(elapsed);
-                    self.increment_rejected_calls();
-                    return Err(StellarError::CircuitOpen {
-                        state: *state,
-                        retry_after,
-                    });
+                    continue;
                 }
-
-                *state = CircuitState::HalfOpen;
-                Ok(())
-            }
-            CircuitState::HalfOpen => {
-                let max_calls = self.config.half_open_max_calls.max(1);
-                let mut in_flight = self.half_open_in_flight.lock().unwrap();
-                if *in_flight >= max_calls {
-                    self.increment_rejected_calls();
-                    Err(StellarError::CircuitOpen {
-                        state: *state,
-                        retry_after: Duration::ZERO,
-                    })
-                } else {
-                    *in_flight += 1;
-                    Ok(())
+                s if s == (CircuitState::HalfOpen as usize) => {
+                    let _max_calls = self.config.half_open_max_calls.max(1) as usize;
+                    let permit = self.half_open_semaphore.try_acquire();
+                    if permit.is_err() {
+                        self.increment_rejected_calls();
+                        return Err(StellarError::CircuitOpen {
+                            state: CircuitState::HalfOpen,
+                            retry_after: Duration::ZERO,
+                        });
+                    }
+                    self.half_open_in_flight.fetch_add(1, Ordering::Relaxed);
+                    return Ok(());
                 }
+                _ => return Ok(()),
             }
         }
     }
 
-    fn record_result<T>(&self, result: &StellarResult<T>) {
+    async fn record_result<T>(&self, result: &StellarResult<T>) {
         match result {
-            Ok(_) => self.record_success(),
-            Err(err) if err.affects_circuit_breaker() => self.record_failure(),
+            Ok(_) => self.record_success().await,
+            Err(err) if err.affects_circuit_breaker() => self.record_failure(err).await,
             Err(_) => {}
         }
     }
 
-    fn record_success(&self) {
-        let state = *self.state.lock().unwrap();
-
-        match state {
-            CircuitState::Closed => {
-                *self.consecutive_failures.lock().unwrap() = 0;
-                self.increment_successful_calls();
-            }
-            CircuitState::HalfOpen => {
+    async fn record_success(&self) {
+        let current = self.state.load(Ordering::Relaxed);
+        if current == (CircuitState::Closed as usize) {
+            self.consecutive_failures.store(0, Ordering::Relaxed);
+            self.increment_successful_calls();
+            return;
+        }
+        if current == (CircuitState::HalfOpen as usize) {
+            self.half_open_in_flight.fetch_sub(1, Ordering::Relaxed);
+            let successes = self.half_open_successes.fetch_add(1, Ordering::Relaxed) + 1;
+            let should_close =
+                successes >= self.config.half_open_max_calls.max(1).try_into().unwrap();
+            self.increment_successful_calls();
+            self.increment_half_open_successes();
+            if should_close {
+                let expected = CircuitState::HalfOpen as usize;
+                let closed = CircuitState::Closed as usize;
+                if self
+                    .state
+                    .compare_exchange(expected, closed, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
                 {
-                    let mut in_flight = self.half_open_in_flight.lock().unwrap();
-                    *in_flight = in_flight.saturating_sub(1);
-                }
-
-                let should_close;
-                {
-                    let mut successes = self.half_open_successes.lock().unwrap();
-                    *successes = successes.saturating_add(1);
-                    should_close = *successes >= self.config.half_open_max_calls.max(1);
-                }
-                {
-                    let mut metrics = self.metrics.lock().unwrap();
-                    metrics.half_open_successes = metrics.half_open_successes.saturating_add(1);
-                }
-                self.increment_successful_calls();
-
-                if should_close {
-                    *self.state.lock().unwrap() = CircuitState::Closed;
-                    *self.opened_at.lock().unwrap() = None;
-                    *self.consecutive_failures.lock().unwrap() = 0;
+                    self.opened_at.lock().unwrap().take();
+                    self.consecutive_failures.store(0, Ordering::Relaxed);
                     self.increment_recoveries();
                 }
             }
-            CircuitState::Open => {}
         }
     }
 
-    fn record_failure(&self) {
-        let state = *self.state.lock().unwrap();
-
-        match state {
-            CircuitState::Closed => {
-                let mut failures = self.consecutive_failures.lock().unwrap();
-                *failures = failures.saturating_add(1);
-                self.increment_failed_calls();
-
-                if *failures >= self.config.failure_threshold.max(1) {
-                    *self.state.lock().unwrap() = CircuitState::Open;
+    async fn record_failure(&self, err: &StellarError) {
+        let current = self.state.load(Ordering::Relaxed);
+        if current == (CircuitState::Closed as usize) {
+            let failures = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
+            match err {
+                StellarError::Timeout { .. } => self.increment_timeout_calls(),
+                StellarError::RetryableHttpStatus { .. } => self.increment_retryable_http_calls(),
+                _ => {}
+            }
+            self.increment_failed_calls();
+            if failures >= self.config.failure_threshold.max(1).try_into().unwrap() {
+                let expected = CircuitState::Closed as usize;
+                let open = CircuitState::Open as usize;
+                if self
+                    .state
+                    .compare_exchange(expected, open, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
                     *self.opened_at.lock().unwrap() = Some(Instant::now());
                     self.increment_trips();
                 }
             }
-            CircuitState::HalfOpen => {
-                {
-                    let mut in_flight = self.half_open_in_flight.lock().unwrap();
-                    *in_flight = in_flight.saturating_sub(1);
-                }
-                {
-                    let mut metrics = self.metrics.lock().unwrap();
-                    metrics.half_open_failures = metrics.half_open_failures.saturating_add(1);
-                }
-                self.increment_failed_calls();
-                *self.state.lock().unwrap() = CircuitState::Open;
+            return;
+        }
+        if current == (CircuitState::HalfOpen as usize) {
+            self.half_open_in_flight.fetch_sub(1, Ordering::Relaxed);
+            let expected = CircuitState::HalfOpen as usize;
+            let open = CircuitState::Open as usize;
+            if self
+                .state
+                .compare_exchange(expected, open, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
                 *self.opened_at.lock().unwrap() = Some(Instant::now());
                 self.increment_trips();
+                self.increment_failed_calls();
+                self.increment_half_open_failures();
             }
-            CircuitState::Open => {}
         }
     }
 
@@ -834,6 +949,26 @@ impl CircuitBreaker {
         let mut metrics = self.metrics.lock().unwrap();
         metrics.failed_calls = metrics.failed_calls.saturating_add(1);
     }
+
+    fn increment_timeout_calls(&self) {
+        let mut metrics = self.metrics.lock().unwrap();
+        metrics.timeout_calls = metrics.timeout_calls.saturating_add(1);
+    }
+
+    fn increment_retryable_http_calls(&self) {
+        let mut metrics = self.metrics.lock().unwrap();
+        metrics.retryable_http_calls = metrics.retryable_http_calls.saturating_add(1);
+    }
+
+    fn increment_half_open_successes(&self) {
+        let mut metrics = self.metrics.lock().unwrap();
+        metrics.half_open_successes = metrics.half_open_successes.saturating_add(1);
+    }
+
+    fn increment_half_open_failures(&self) {
+        let mut metrics = self.metrics.lock().unwrap();
+        metrics.half_open_failures = metrics.half_open_failures.saturating_add(1);
+    }
 }
 
 impl fmt::Display for CircuitState {
@@ -854,7 +989,7 @@ fn is_retryable_status(status: u16) -> bool {
     status == 408 || status == 429 || (500..=599).contains(&status)
 }
 
-fn jittered_delay(max_delay: Duration) -> Duration {
+fn jittered_delay_full(max_delay: Duration) -> Duration {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -862,6 +997,19 @@ fn jittered_delay(max_delay: Duration) -> Duration {
     let fraction = nanos as f64 / 1_000_000_000.0;
     let millis = (max_delay.as_secs_f64() * 1000.0 * fraction).round() as u64;
     Duration::from_millis(millis)
+}
+
+fn jittered_delay_equal(max_delay: Duration) -> Duration {
+    let millis = (max_delay.as_secs_f64() * 1000.0 / 2.0).round() as u64;
+    Duration::from_millis(millis)
+}
+
+fn jittered_delay_decorrelated(base: Duration, _attempt: u32) -> Duration {
+    let mut rng = rand::thread_rng();
+    let millis = base.as_millis() as u64;
+    let decorrelated = millis.saturating_mul(3).saturating_div(4);
+    let jitter = rng.gen_range(0..decorrelated.max(1));
+    Duration::from_millis(jitter.min(base.as_millis() as u64))
 }
 
 async fn sleep(delay: Duration) {
@@ -895,6 +1043,8 @@ mod tests {
             request_timeout: Duration::from_secs(2),
             rate_limit_per_second: 100,
             rate_limit_burst: 100,
+            bulkhead: BulkheadConfig::default(),
+            graceful_degradation: GracefulDegradationConfig::default(),
         }
     }
 
@@ -1009,10 +1159,7 @@ mod tests {
 
         let err = client.verify_hash_with_retry(hash).await.unwrap_err();
         match err {
-            StellarError::CircuitOpen {
-                state,
-                retry_after,
-            } => {
+            StellarError::CircuitOpen { state, retry_after } => {
                 assert_eq!(state, CircuitState::Open);
                 assert!(retry_after <= Duration::from_millis(50));
             }
@@ -1157,18 +1304,15 @@ mod tests {
             Mock::given(method("GET"))
                 .and(path("transactions"))
                 .and(query_param("memo", hash))
-                .respond_with(ResponseTemplate::new(200).set_body_json(
-                    horizon_tx_json(
-                        "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-                        hash,
-                        "2024-01-15T10:30:00Z",
-                    ),
-                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(horizon_tx_json(
+                    "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+                    hash,
+                    "2024-01-15T10:30:00Z",
+                )))
                 .mount(&server)
                 .await;
 
-            let client = StellarClient::new(&server.uri())
-                .with_max_retries(0);
+            let client = StellarClient::new(&server.uri()).with_max_retries(0);
 
             let result = client.verify_hash(hash).await;
 
@@ -1189,8 +1333,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let client = StellarClient::new(&server.uri())
-                .with_max_retries(0);
+            let client = StellarClient::new(&server.uri()).with_max_retries(0);
 
             let result = client.verify_hash(hash).await;
 
@@ -1207,18 +1350,15 @@ mod tests {
             Mock::given(method("GET"))
                 .and(path("transactions"))
                 .and(query_param("memo", hash))
-                .respond_with(ResponseTemplate::new(200).set_body_json(
-                    horizon_tx_json(
-                        "tx123",
-                        "wrong-hash-0000000000000000000000000000000000000000000000000000",
-                        "2024-01-15T10:30:00Z",
-                    ),
-                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(horizon_tx_json(
+                    "tx123",
+                    "wrong-hash-0000000000000000000000000000000000000000000000000000",
+                    "2024-01-15T10:30:00Z",
+                )))
                 .mount(&server)
                 .await;
 
-            let client = StellarClient::new(&server.uri())
-                .with_max_retries(0);
+            let client = StellarClient::new(&server.uri()).with_max_retries(0);
 
             let result = client.verify_hash(hash).await;
 
@@ -1237,8 +1377,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let client = StellarClient::new(&server.uri())
-                .with_max_retries(0);
+            let client = StellarClient::new(&server.uri()).with_max_retries(0);
 
             let result = client.verify_hash(hash).await;
 
@@ -1253,14 +1392,11 @@ mod tests {
 
             Mock::given(method("GET"))
                 .and(path("transactions"))
-                .respond_with(
-                    ResponseTemplate::new(200).set_body_string("not-valid-json{{{")
-                )
+                .respond_with(ResponseTemplate::new(200).set_body_string("not-valid-json{{{"))
                 .mount(&server)
                 .await;
 
-            let client = StellarClient::new(&server.uri())
-                .with_max_retries(0);
+            let client = StellarClient::new(&server.uri()).with_max_retries(0);
 
             let result = client.verify_hash(hash).await;
 
@@ -1286,9 +1422,11 @@ mod tests {
             Mock::given(method("GET"))
                 .and(path("transactions"))
                 .and(query_param("memo", hash))
-                .respond_with(ResponseTemplate::new(200).set_body_json(
-                    horizon_tx_json("tx-retry-ok", hash, "2024-01-15T10:30:00Z"),
-                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(horizon_tx_json(
+                    "tx-retry-ok",
+                    hash,
+                    "2024-01-15T10:30:00Z",
+                )))
                 .mount(&server)
                 .await;
 
@@ -1314,8 +1452,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let client = StellarClient::new(&server.uri())
-                .with_max_retries(3);
+            let client = StellarClient::new(&server.uri()).with_max_retries(3);
 
             let result = client.verify_hash(hash).await;
 

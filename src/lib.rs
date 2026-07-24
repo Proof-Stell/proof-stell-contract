@@ -476,7 +476,9 @@ impl ProofStellContract {
 
     /// Returns the stored admin address, or `None` if the contract is not yet initialized.
     pub fn get_admin(env: Env) -> Option<Address> {
-        env.storage().persistent().get::<DataKey, Address>(&DataKey::Admin)
+        env.storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::Admin)
     }
 
     /// Upgrades the contract WASM to the given hash.
@@ -785,9 +787,18 @@ mod tests {
 
         let docs = soroban_sdk::vec![
             &env,
-            DocumentInfo { owner: owner.clone(), document_hash: BytesN::from_array(&env, &[1; 32]) },
-            DocumentInfo { owner: owner.clone(), document_hash: BytesN::from_array(&env, &[2; 32]) },
-            DocumentInfo { owner: owner.clone(), document_hash: BytesN::from_array(&env, &[3; 32]) },
+            DocumentInfo {
+                owner: owner.clone(),
+                document_hash: BytesN::from_array(&env, &[1; 32])
+            },
+            DocumentInfo {
+                owner: owner.clone(),
+                document_hash: BytesN::from_array(&env, &[2; 32])
+            },
+            DocumentInfo {
+                owner: owner.clone(),
+                document_hash: BytesN::from_array(&env, &[3; 32])
+            },
         ];
 
         let records = client.batch_register_documents(&issuer, &docs);
@@ -809,9 +820,18 @@ mod tests {
 
         let docs = soroban_sdk::vec![
             &env,
-            DocumentInfo { owner: owner.clone(), document_hash: BytesN::from_array(&env, &[3; 32]) },
-            DocumentInfo { owner: owner.clone(), document_hash: hash1.clone() },
-            DocumentInfo { owner: owner.clone(), document_hash: hash2.clone() },
+            DocumentInfo {
+                owner: owner.clone(),
+                document_hash: BytesN::from_array(&env, &[3; 32])
+            },
+            DocumentInfo {
+                owner: owner.clone(),
+                document_hash: hash1.clone()
+            },
+            DocumentInfo {
+                owner: owner.clone(),
+                document_hash: hash2.clone()
+            },
         ];
 
         let err = client
@@ -872,7 +892,12 @@ mod tests {
             client.register_document(&issuer, &owner, h);
         }
 
-        let hash_vec = soroban_sdk::vec![&env, hashes[0].clone(), hashes[1].clone(), hashes[2].clone()];
+        let hash_vec = soroban_sdk::vec![
+            &env,
+            hashes[0].clone(),
+            hashes[1].clone(),
+            hashes[2].clone()
+        ];
         let records = client.batch_revoke_documents(&issuer, &hash_vec);
 
         assert_eq!(records.len(), 3);
@@ -1016,10 +1041,7 @@ mod tests {
         let admin = Address::generate(&env);
         let wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
 
-        let err = client
-            .try_upgrade(&admin, &wasm_hash)
-            .unwrap_err()
-            .unwrap();
+        let err = client.try_upgrade(&admin, &wasm_hash).unwrap_err().unwrap();
         assert_eq!(err, ContractError::NotInitialized);
     }
 
@@ -1032,10 +1054,7 @@ mod tests {
 
         client.initialize(&admin);
 
-        let err = client
-            .try_upgrade(&other, &wasm_hash)
-            .unwrap_err()
-            .unwrap();
+        let err = client.try_upgrade(&other, &wasm_hash).unwrap_err().unwrap();
         assert_eq!(err, ContractError::Unauthorized);
     }
 
@@ -1078,7 +1097,10 @@ mod tests {
 
         // Document still verifiable after migration.
         assert!(client.verify_document(&document_hash));
-        assert_eq!(client.get_document_status(&document_hash), DocumentStatus::Active);
+        assert_eq!(
+            client.get_document_status(&document_hash),
+            DocumentStatus::Active
+        );
     }
 
     // --- feature flags ---
