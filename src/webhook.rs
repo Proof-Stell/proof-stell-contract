@@ -30,8 +30,8 @@ type HmacSha256 = Hmac<Sha256>;
 /// The signature is computed over the serialized JSON body using the configured
 /// webhook secret. Receivers can verify the signature using the shared secret.
 fn compute_webhook_signature(secret: &str, body: &[u8]) -> String {
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .expect("HMAC-SHA256 accepts any key length");
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC-SHA256 accepts any key length");
     mac.update(body);
     let result = mac.finalize();
     let code = result.into_bytes();
@@ -242,7 +242,7 @@ impl WebhookDispatcher {
         if let Some(cache) = &self.cache {
             let dedup_key = format!("{}{}", DEDUP_KEY_PREFIX, event.idempotency_key);
             let cache_key = CacheKey::Events(dedup_key);
-            
+
             if let Ok(Some(_)) = cache.get_raw(&cache_key).await {
                 // Already delivered, skip
                 if let Some(ref m) = self.metrics {
@@ -250,9 +250,11 @@ impl WebhookDispatcher {
                 }
                 return;
             }
-            
+
             // Mark as delivered with TTL
-            let _ = cache.set_raw(&cache_key, "delivered", self.deduplication_ttl).await;
+            let _ = cache
+                .set_raw(&cache_key, "delivered", self.deduplication_ttl)
+                .await;
         }
 
         let payload = WebhookPayload::from(event);
@@ -456,7 +458,7 @@ fn jitter_ms(max_ms: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::{CacheBackend, InMemoryCache};
+    use crate::cache::CacheBackend;
     use std::sync::Arc;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -952,13 +954,15 @@ mod tests {
             ..Default::default()
         };
 
-        let dispatcher = WebhookDispatcher::new(config, None)
-            .with_cache(Arc::clone(&cache));
+        let dispatcher = WebhookDispatcher::new(config, None).with_cache(Arc::clone(&cache));
         dispatcher.dispatch(&make_event()).await;
 
         let dlq_key = CacheKey::Events(format!("{}{}", DLQ_REDIS_KEY_PREFIX, server.uri()));
         let persisted = cache.get_raw(&dlq_key).await.unwrap();
-        assert!(persisted.is_some(), "DLQ entry should be persisted to cache");
+        assert!(
+            persisted.is_some(),
+            "DLQ entry should be persisted to cache"
+        );
 
         let entry: DeadLetterEntry = serde_json::from_str(&persisted.unwrap()).unwrap();
         assert_eq!(entry.url, server.uri());
@@ -982,8 +986,7 @@ mod tests {
             ..Default::default()
         };
 
-        let dispatcher = WebhookDispatcher::new(config, None)
-            .with_cache(Arc::clone(&cache));
+        let dispatcher = WebhookDispatcher::new(config, None).with_cache(Arc::clone(&cache));
         dispatcher.dispatch(&make_event()).await;
 
         // Drain returns the persisted entry (single source of truth when cache is available)

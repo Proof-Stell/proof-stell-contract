@@ -1,6 +1,6 @@
 use prometheus::{
-    Counter, Encoder, Gauge, HistogramOpts, HistogramVec, IntCounter, IntCounterVec,
-    Opts, Registry, TextEncoder,
+    Counter, Encoder, Gauge, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, Opts,
+    Registry, TextEncoder,
 };
 use std::prelude::v1::*;
 use std::sync::Arc;
@@ -56,6 +56,11 @@ pub struct MetricsRegistry {
     config_validation_failures: IntCounter,
     config_reload_total: IntCounter,
 
+    // ── Circuit breaker metrics ──
+    circuit_state: Gauge,
+    circuit_transitions_total: IntCounterVec,
+    circuit_state_changes_total: IntCounterVec,
+
     // ── Webhook delivery metrics ──
     webhook_deliveries_total: IntCounterVec,
     webhook_delivery_latency_seconds: HistogramVec,
@@ -74,8 +79,7 @@ impl MetricsRegistry {
         let registry = Registry::new();
 
         // ── General request metrics ──
-        let request_count =
-            Counter::new("requests_total", "Total number of API requests").unwrap();
+        let request_count = Counter::new("requests_total", "Total number of API requests").unwrap();
         let error_count =
             Counter::new("errors_total", "Total number of errors encountered").unwrap();
 
@@ -93,7 +97,8 @@ impl MetricsRegistry {
         )
         .unwrap();
         let cache_size = Gauge::new("cache_size", "Current number of entries in cache").unwrap();
-        let cache_evictions = IntCounter::new("cache_evictions_total", "Total cache evictions").unwrap();
+        let cache_evictions =
+            IntCounter::new("cache_evictions_total", "Total cache evictions").unwrap();
         let cache_hit_rate = Gauge::new("cache_hit_rate", "Current cache hit rate (0-1)").unwrap();
 
         // ── Document metrics ──
@@ -140,9 +145,11 @@ impl MetricsRegistry {
         )
         .unwrap();
 
-        let retry_total =
-            IntCounter::new("retry_total", "Total number of retry attempts across all operations")
-                .unwrap();
+        let retry_total = IntCounter::new(
+            "retry_total",
+            "Total number of retry attempts across all operations",
+        )
+        .unwrap();
 
         // ── Rate limiter metrics (legacy) ──
         let rate_limit_tokens_consumed = IntCounter::new(
@@ -211,6 +218,31 @@ impl MetricsRegistry {
         )
         .unwrap();
 
+        // ── Circuit breaker metrics ─────────────────────────────────────
+        let circuit_state = Gauge::new(
+            "circuit_breaker_state",
+            "Current circuit breaker state (0=closed, 1=open, 2=half_open)",
+        )
+        .unwrap();
+
+        let circuit_transitions_total = IntCounterVec::new(
+            Opts::new(
+                "circuit_breaker_transitions_total",
+                "Total circuit breaker state transitions by target state",
+            ),
+            &["to_state"],
+        )
+        .unwrap();
+
+        let circuit_state_changes_total = IntCounterVec::new(
+            Opts::new(
+                "circuit_breaker_state_changes_total",
+                "Total circuit breaker state changes by from_state and to_state",
+            ),
+            &["from_state", "to_state"],
+        )
+        .unwrap();
+
         // ── Webhook delivery metrics ──
         let webhook_deliveries_total = IntCounterVec::new(
             Opts::new(
@@ -268,6 +300,9 @@ impl MetricsRegistry {
             Box::new(event_backlog_size.clone()),
             Box::new(config_validation_failures.clone()),
             Box::new(config_reload_total.clone()),
+            Box::new(circuit_state.clone()),
+            Box::new(circuit_transitions_total.clone()),
+            Box::new(circuit_state_changes_total.clone()),
             Box::new(webhook_deliveries_total.clone()),
             Box::new(webhook_delivery_latency_seconds.clone()),
             Box::new(webhook_dlq_depth.clone()),
@@ -302,6 +337,9 @@ impl MetricsRegistry {
             event_backlog_size,
             config_validation_failures,
             config_reload_total,
+            circuit_state,
+            circuit_transitions_total,
+            circuit_state_changes_total,
             webhook_deliveries_total,
             webhook_delivery_latency_seconds,
             webhook_dlq_depth,
@@ -405,9 +443,7 @@ impl MetricsRegistry {
 
     /// Record an accepted request for `issuer`.
     pub fn increment_rate_limit_hit(&self, issuer: &str) {
-        self.rate_limit_hits
-            .with_label_values(&[issuer])
-            .inc();
+        self.rate_limit_hits.with_label_values(&[issuer]).inc();
     }
 
     /// Record a rejection originating from the **global** tier.
@@ -456,7 +492,25 @@ impl MetricsRegistry {
         self.config_reload_total.inc();
     }
 
-    // ── Webhook delivery metrics ─────────────────────────────────────────
+    // ── Circuit breaker metrics ──────────────────────────────────────
+
+    pub fn set_circuit_state(&self, state: i64) {
+        self.circuit_state.set(state as f64);
+    }
+
+    pub fn record_circuit_transition(&self, to_state: &str) {
+        self.circuit_transitions_total
+            .with_label_values(&[to_state])
+            .inc();
+    }
+
+    pub fn record_circuit_state_change(&self, from_state: &str, to_state: &str) {
+        self.circuit_state_changes_total
+            .with_label_values(&[from_state, to_state])
+            .inc();
+    }
+
+    // ── Webhook delivery metrics ──────────────────────────────────────
 
     /// Record a completed delivery attempt (success or dead_lettered) with latency.
     pub fn record_webhook_delivery(&self, status: &str, latency_secs: f64) {
