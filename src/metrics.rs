@@ -39,6 +39,7 @@ pub struct MetricsRegistry {
     // ── Rate limiter metrics (legacy global) ──
     rate_limit_tokens_consumed: IntCounter,
     rate_limit_violations: IntCounter,
+    rate_limit_resets: IntCounter,
 
     // ── Rate limiter metrics (per-issuer, two-tier) ──
     /// Counts every request that passed both rate-limit tiers, labelled by issuer.
@@ -161,6 +162,12 @@ impl MetricsRegistry {
         let rate_limit_violations = IntCounter::new(
             "rate_limit_violations_total",
             "Total rate limit violations – legacy global limiter (requests rejected)",
+        )
+        .unwrap();
+
+        let rate_limit_resets = IntCounter::new(
+            "rate_limit_resets_total",
+            "Total rate limiter bucket resets or refills after exhaustion",
         )
         .unwrap();
 
@@ -293,6 +300,7 @@ impl MetricsRegistry {
             Box::new(retry_total.clone()),
             Box::new(rate_limit_tokens_consumed.clone()),
             Box::new(rate_limit_violations.clone()),
+            Box::new(rate_limit_resets.clone()),
             Box::new(rate_limit_hits.clone()),
             Box::new(rate_limit_rejections.clone()),
             Box::new(event_duplicates.clone()),
@@ -330,6 +338,7 @@ impl MetricsRegistry {
             retry_total,
             rate_limit_tokens_consumed,
             rate_limit_violations,
+            rate_limit_resets,
             rate_limit_hits,
             rate_limit_rejections,
             event_duplicates,
@@ -437,6 +446,10 @@ impl MetricsRegistry {
 
     pub fn increment_rate_limit_violation(&self) {
         self.rate_limit_violations.inc();
+    }
+
+    pub fn increment_rate_limit_reset(&self) {
+        self.rate_limit_resets.inc();
     }
 
     // ── Rate limiter metrics (per-issuer, two-tier) ──────────────────────
