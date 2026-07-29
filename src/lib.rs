@@ -23,10 +23,31 @@ pub mod rate_limit;
 pub mod stellar;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod webhook;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::{Arc, OnceLock};
+
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env,
     Symbol, Vec,
 };
+
+#[cfg(not(target_arch = "wasm32"))]
+use crate::metrics::MetricsRegistry;
+
+#[cfg(not(target_arch = "wasm32"))]
+static RATE_LIMIT_METRICS: OnceLock<Arc<MetricsRegistry>> = OnceLock::new();
+
+#[cfg(not(target_arch = "wasm32"))]
+fn rate_limit_metrics() -> Arc<MetricsRegistry> {
+    RATE_LIMIT_METRICS
+        .get_or_init(|| Arc::new(MetricsRegistry::new()))
+        .clone()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn rate_limit_metrics() -> () {
+    ()
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -50,6 +71,9 @@ pub enum DataKey {
     Admin,
     Version,
     FeatureFlag(Symbol),
+    RateLimitConfig,
+    RateLimitState(RateLimitScope),
+    RateLimitRetryAfter(RateLimitScope),
 }
 
 pub const CONTRACT_VERSION: u32 = 1;
@@ -62,6 +86,40 @@ pub struct DocumentInfo {
 }
 
 pub const MAX_BATCH_SIZE: u32 = 20;
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RateLimitConfig {
+    pub per_address_per_second: u32,
+    pub per_address_burst: u32,
+    pub per_issuer_per_second: u32,
+    pub per_issuer_burst: u32,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            per_address_per_second: 100,
+            per_address_burst: 200,
+            per_issuer_per_second: 100,
+            per_issuer_burst: 200,
+        }
+    }
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RateLimitBucketState {
+    pub tokens: u32,
+    pub last_refill: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RateLimitScope {
+    Address(Address),
+    Issuer(Address),
+}
 
 /// Enumeration of all error conditions that can occur within the ProofStell contract.
 ///
@@ -110,6 +168,8 @@ pub enum ContractError {
     Unauthorized = 11,
     /// The contract is already at the latest version; no migration is needed. Code: 12
     MigrationNotNeeded = 12,
+    /// A rate-limit quota was exceeded for the caller. Code: 13
+    RateLimitExceeded = 13,
 }
 
 #[contractevent(topics = ["register"], data_format = "vec")]
@@ -169,6 +229,7 @@ impl ProofStellContract {
         document_hash: BytesN<32>,
     ) -> Result<DocumentRecord, ContractError> {
         issuer.require_auth();
+        Self::check_rate_limit(&env, &issuer, &issuer)?;
 
         let key = DataKey::Document(document_hash.clone());
 
@@ -279,6 +340,7 @@ impl ProofStellContract {
         document_hash: BytesN<32>,
     ) -> Result<DocumentRecord, ContractError> {
         issuer.require_auth();
+        Self::check_rate_limit(&env, &issuer, &issuer)?;
 
         let key = DataKey::Document(document_hash.clone());
 
@@ -331,6 +393,7 @@ impl ProofStellContract {
         documents: Vec<DocumentInfo>,
     ) -> Result<Vec<DocumentRecord>, ContractError> {
         issuer.require_auth();
+        Self::check_rate_limit(&env, &issuer, &issuer)?;
 
         if documents.is_empty() {
             return Err(ContractError::BatchEmpty);
@@ -394,6 +457,7 @@ impl ProofStellContract {
         document_hashes: Vec<BytesN<32>>,
     ) -> Result<Vec<DocumentRecord>, ContractError> {
         issuer.require_auth();
+        Self::check_rate_limit(&env, &issuer, &issuer)?;
 
         if document_hashes.is_empty() {
             return Err(ContractError::BatchEmpty);
@@ -615,6 +679,106 @@ impl ProofStellContract {
             .get::<DataKey, bool>(&DataKey::FeatureFlag(flag))
             .unwrap_or(false)
     }
+
+    /// Updates the rate-limit configuration for all contract operations.
+    pub fn set_rate_limit_config(
+        env: Env,
+        admin: Address,
+        config: RateLimitConfig,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+
+        let stored_admin = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .ok_or(ContractError::NotInitialized)?;
+
+        if stored_admin != admin {
+            return Err(ContractError::Unauthorized);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::RateLimitConfig, &config);
+        Ok(())
+    }
+
+    /// Returns the current retry-after guidance for a scope, if one is pending.
+    pub fn get_rate_limit_retry_after(env: Env, scope: RateLimitScope) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, u64>(&DataKey::RateLimitRetryAfter(scope))
+    }
+
+    fn check_rate_limit(env: &Env, caller: &Address, issuer: &Address) -> Result<(), ContractError> {
+        let config = env
+            .storage()
+            .persistent()
+            .get::<DataKey, RateLimitConfig>(&DataKey::RateLimitConfig)
+            .unwrap_or_default();
+
+        let now = env.ledger().timestamp();
+        let address_scope = RateLimitScope::Address(caller.clone());
+        let issuer_scope = RateLimitScope::Issuer(issuer.clone());
+
+        for scope in [address_scope.clone(), issuer_scope.clone()] {
+            let metrics = rate_limit_metrics();
+            let (capacity, per_second) = match scope {
+                RateLimitScope::Address(_) => (config.per_address_burst, config.per_address_per_second),
+                RateLimitScope::Issuer(_) => (config.per_issuer_burst, config.per_issuer_per_second),
+            };
+            let mut state = env
+                .storage()
+                .persistent()
+                .get::<DataKey, RateLimitBucketState>(&DataKey::RateLimitState(scope.clone()))
+                .unwrap_or(RateLimitBucketState {
+                    tokens: capacity,
+                    last_refill: now,
+                });
+
+            let elapsed = now.saturating_sub(state.last_refill);
+            let refill = elapsed.saturating_mul(per_second as u64);
+            let tokens = state.tokens.saturating_add(refill as u32).min(capacity);
+            let reset_detected = state.tokens == 0 && tokens > 0;
+
+            if tokens == 0 {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    metrics.increment_rate_limit_violation();
+                    metrics.increment_rate_limit_global_rejection("contract");
+                }
+                let retry_after = if per_second > 0 {
+                    (1u64).saturating_div(per_second as u64).max(1)
+                } else {
+                    1u64
+                };
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::RateLimitRetryAfter(scope), &retry_after);
+                return Err(ContractError::RateLimitExceeded);
+            }
+
+            if reset_detected {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    metrics.increment_rate_limit_reset();
+                }
+            }
+
+            state.tokens = tokens.saturating_sub(1);
+            state.last_refill = now;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                metrics.record_token_consumed();
+                metrics.increment_rate_limit_hit("contract");
+            }
+            env.storage().persistent().set(&DataKey::RateLimitState(scope.clone()), &state);
+            env.storage().persistent().remove(&DataKey::RateLimitRetryAfter(scope));
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -641,6 +805,132 @@ mod tests {
         let document_hash = BytesN::from_array(&env, &[7; 32]);
 
         (env, client, issuer, owner, document_hash)
+    }
+
+    fn setup_with_config(
+        env: &Env,
+        client: &ProofStellContractClient<'static>,
+        issuer: &Address,
+        owner: &Address,
+        config: RateLimitConfig,
+    ) {
+        let admin = Address::generate(env);
+        client.initialize(&admin);
+        client.set_rate_limit_config(&admin, &config);
+
+        let _ = (issuer, owner);
+    }
+
+    #[test]
+    fn rate_limit_allows_burst_then_blocks_excess() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(ProofStellContract, ());
+        let client = ProofStellContractClient::new(&env, &contract_id);
+        let issuer = Address::generate(&env);
+        let owner = Address::generate(&env);
+
+        let config = RateLimitConfig {
+            per_address_per_second: 1,
+            per_address_burst: 2,
+            per_issuer_per_second: 1,
+            per_issuer_burst: 2,
+        };
+        setup_with_config(&env, &client, &issuer, &owner, config);
+
+        let hash1 = BytesN::from_array(&env, &[1; 32]);
+        let hash2 = BytesN::from_array(&env, &[2; 32]);
+        let hash3 = BytesN::from_array(&env, &[3; 32]);
+
+        client.register_document(&issuer, &owner, &hash1);
+        client.register_document(&issuer, &owner, &hash2);
+
+        let err = client
+            .try_register_document(&issuer, &owner, &hash3)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::RateLimitExceeded);
+    }
+
+    #[test]
+    fn rate_limit_refills_after_wait() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(ProofStellContract, ());
+        let client = ProofStellContractClient::new(&env, &contract_id);
+        let issuer = Address::generate(&env);
+        let owner = Address::generate(&env);
+
+        let config = RateLimitConfig {
+            per_address_per_second: 1,
+            per_address_burst: 1,
+            per_issuer_per_second: 1,
+            per_issuer_burst: 1,
+        };
+        setup_with_config(&env, &client, &issuer, &owner, config);
+
+        let hash1 = BytesN::from_array(&env, &[10; 32]);
+        let hash2 = BytesN::from_array(&env, &[11; 32]);
+        client.register_document(&issuer, &owner, &hash1);
+
+        let err = client
+            .try_register_document(&issuer, &owner, &hash2)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::RateLimitExceeded);
+
+        let state = RateLimitBucketState {
+            tokens: 1,
+            last_refill: 0,
+        };
+        env.as_contract(&contract_id, || {
+            env.storage().persistent().set(
+                &DataKey::RateLimitState(RateLimitScope::Address(issuer.clone())),
+                &state,
+            );
+            env.storage().persistent().set(
+                &DataKey::RateLimitState(RateLimitScope::Issuer(issuer.clone())),
+                &state,
+            );
+        });
+
+        let hash3 = BytesN::from_array(&env, &[12; 32]);
+        client.register_document(&issuer, &owner, &hash3);
+    }
+
+    #[test]
+    fn rate_limit_is_scoped_per_address() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(ProofStellContract, ());
+        let client = ProofStellContractClient::new(&env, &contract_id);
+        let issuer = Address::generate(&env);
+        let other_issuer = Address::generate(&env);
+        let owner = Address::generate(&env);
+
+        let config = RateLimitConfig {
+            per_address_per_second: 1,
+            per_address_burst: 1,
+            per_issuer_per_second: 10,
+            per_issuer_burst: 10,
+        };
+        setup_with_config(&env, &client, &issuer, &owner, config);
+
+        let hash1 = BytesN::from_array(&env, &[20; 32]);
+        let hash2 = BytesN::from_array(&env, &[21; 32]);
+        client.register_document(&issuer, &owner, &hash1);
+
+        let err = client
+            .try_register_document(&issuer, &owner, &hash2)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::RateLimitExceeded);
+
+        let hash3 = BytesN::from_array(&env, &[22; 32]);
+        client.register_document(&other_issuer, &owner, &hash3);
     }
 
     #[test]

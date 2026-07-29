@@ -151,6 +151,17 @@ DocumentHash → DocumentRecord
 * Issuer authorization
 * Immutable records
 * Revocation tracking
+* Contract-level rate limiting for registration, revocation, and batch operations
+
+### Rate limiting
+
+The contract now enforces configurable per-address and per-issuer token buckets for document operations. The admin can set the limits with `set_rate_limit_config`, and the contract returns `ContractError::RateLimitExceeded` once a bucket is exhausted. Callers can inspect `get_rate_limit_retry_after` to learn the delay before retrying.
+
+Suggested production tuning:
+
+* Keep `per_address_burst` and `per_issuer_burst` slightly above the expected steady-state traffic so burst traffic is allowed without opening the door to abuse.
+* Start with conservative values for `per_address_per_second` and `per_issuer_per_second`, then increase only after observing real traffic patterns.
+* Use separate issuer-level throttles for high-volume integrations and address-level throttles for public-facing clients.
 
 ---
 
