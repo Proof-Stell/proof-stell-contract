@@ -42,7 +42,7 @@ mod native {
     use axum::{Json, Router};
     use serde_json::json;
 
-    use proofstell_contract::cache::{CacheBackend, InMemoryCache};
+    use proofstell_contract::cache::{CacheBackend, CacheBulkheadConfig, CacheCircuitBreakerConfig, InMemoryCache};
     use proofstell_contract::config::{self, AppConfig, ConfigUpdate, ConfigWatcher};
     use proofstell_contract::metrics::MetricsRegistry;
     use proofstell_contract::webhook::WebhookDispatcher;
@@ -202,7 +202,22 @@ mod native {
         let cache: Arc<CacheBackend> = match config.cache_backend.as_str() {
             "redis" => {
                 eprintln!("[proofstell] Initializing Redis cache backend...");
-                match proofstell_contract::cache::RedisCache::new(&config.redis_url).await {
+                let cb_config = CacheCircuitBreakerConfig {
+                    failure_threshold: config.cache_circuit_breaker_failure_threshold,
+                    open_duration_ms: config.cache_circuit_breaker_open_duration_ms,
+                    half_open_max_calls: config.cache_circuit_breaker_half_open_max_calls,
+                    backoff_base_ms: config.cache_circuit_breaker_backoff_base_ms,
+                    backoff_max_ms: config.cache_circuit_breaker_backoff_max_ms,
+                };
+                let bulkhead_config = CacheBulkheadConfig {
+                    max_concurrent: config.cache_bulkhead_max_concurrent,
+                    max_queue: config.cache_bulkhead_max_queue,
+                };
+                match proofstell_contract::cache::RedisCache::with_config(
+                    &config.redis_url,
+                    cb_config,
+                    bulkhead_config,
+                ).await {
                     Ok(redis_cache) => {
                         let cache = redis_cache.with_metrics(Arc::clone(&metrics));
                         Arc::new(CacheBackend::Redis(cache))
