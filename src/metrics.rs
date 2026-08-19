@@ -62,6 +62,17 @@ pub struct MetricsRegistry {
     circuit_transitions_total: IntCounterVec,
     circuit_state_changes_total: IntCounterVec,
 
+    // ── Cache circuit breaker metrics ──
+    cache_circuit_state: Gauge,
+    cache_circuit_transitions_total: IntCounterVec,
+    cache_circuit_rejections_total: IntCounter,
+    cache_circuit_recoveries_total: IntCounter,
+    cache_fallback_uses_total: IntCounter,
+
+    // ── Cache bulkhead metrics ──
+    cache_bulkhead_active: Gauge,
+    cache_bulkhead_rejections_total: IntCounter,
+
     // ── Webhook delivery metrics ──
     webhook_deliveries_total: IntCounterVec,
     webhook_delivery_latency_seconds: HistogramVec,
@@ -250,6 +261,53 @@ impl MetricsRegistry {
         )
         .unwrap();
 
+        // ── Cache circuit breaker metrics ────────────────────────────────
+        let cache_circuit_state = Gauge::new(
+            "cache_circuit_breaker_state",
+            "Current cache circuit breaker state (0=closed, 1=open, 2=half_open)",
+        )
+        .unwrap();
+
+        let cache_circuit_transitions_total = IntCounterVec::new(
+            Opts::new(
+                "cache_circuit_breaker_transitions_total",
+                "Total cache circuit breaker state transitions",
+            ),
+            &["from_state", "to_state"],
+        )
+        .unwrap();
+
+        let cache_circuit_rejections_total = IntCounter::new(
+            "cache_circuit_breaker_rejections_total",
+            "Total cache operations rejected by circuit breaker",
+        )
+        .unwrap();
+
+        let cache_circuit_recoveries_total = IntCounter::new(
+            "cache_circuit_breaker_recoveries_total",
+            "Total cache circuit breaker recovery successes",
+        )
+        .unwrap();
+
+        let cache_fallback_uses_total = IntCounter::new(
+            "cache_fallback_uses_total",
+            "Total cache operations falling back to InMemory",
+        )
+        .unwrap();
+
+        // ── Cache bulkhead metrics ───────────────────────────────────────
+        let cache_bulkhead_active = Gauge::new(
+            "cache_bulkhead_active_operations",
+            "Current number of active cache bulkhead operations",
+        )
+        .unwrap();
+
+        let cache_bulkhead_rejections_total = IntCounter::new(
+            "cache_bulkhead_rejections_total",
+            "Total cache operations rejected by bulkhead",
+        )
+        .unwrap();
+
         // ── Webhook delivery metrics ──
         let webhook_deliveries_total = IntCounterVec::new(
             Opts::new(
@@ -311,6 +369,13 @@ impl MetricsRegistry {
             Box::new(circuit_state.clone()),
             Box::new(circuit_transitions_total.clone()),
             Box::new(circuit_state_changes_total.clone()),
+            Box::new(cache_circuit_state.clone()),
+            Box::new(cache_circuit_transitions_total.clone()),
+            Box::new(cache_circuit_rejections_total.clone()),
+            Box::new(cache_circuit_recoveries_total.clone()),
+            Box::new(cache_fallback_uses_total.clone()),
+            Box::new(cache_bulkhead_active.clone()),
+            Box::new(cache_bulkhead_rejections_total.clone()),
             Box::new(webhook_deliveries_total.clone()),
             Box::new(webhook_delivery_latency_seconds.clone()),
             Box::new(webhook_dlq_depth.clone()),
@@ -349,6 +414,13 @@ impl MetricsRegistry {
             circuit_state,
             circuit_transitions_total,
             circuit_state_changes_total,
+            cache_circuit_state,
+            cache_circuit_transitions_total,
+            cache_circuit_rejections_total,
+            cache_circuit_recoveries_total,
+            cache_fallback_uses_total,
+            cache_bulkhead_active,
+            cache_bulkhead_rejections_total,
             webhook_deliveries_total,
             webhook_delivery_latency_seconds,
             webhook_dlq_depth,
@@ -523,6 +595,40 @@ impl MetricsRegistry {
             .inc();
     }
 
+    // ── Cache circuit breaker metrics ──────────────────────────────────
+
+    pub fn set_cache_circuit_state(&self, state: i64) {
+        self.cache_circuit_state.set(state as f64);
+    }
+
+    pub fn record_cache_circuit_transition(&self, from_state: &str, to_state: &str) {
+        self.cache_circuit_transitions_total
+            .with_label_values(&[from_state, to_state])
+            .inc();
+    }
+
+    pub fn increment_cache_circuit_rejection(&self) {
+        self.cache_circuit_rejections_total.inc();
+    }
+
+    pub fn increment_cache_circuit_recovery(&self) {
+        self.cache_circuit_recoveries_total.inc();
+    }
+
+    pub fn increment_cache_fallback_use(&self) {
+        self.cache_fallback_uses_total.inc();
+    }
+
+    // ── Cache bulkhead metrics ─────────────────────────────────────────
+
+    pub fn set_cache_bulkhead_active(&self, active: i64) {
+        self.cache_bulkhead_active.set(active as f64);
+    }
+
+    pub fn increment_cache_bulkhead_rejection(&self) {
+        self.cache_bulkhead_rejections_total.inc();
+    }
+
     // ── Webhook delivery metrics ──────────────────────────────────────
 
     /// Record a completed delivery attempt (success or dead_lettered) with latency.
@@ -609,6 +715,13 @@ mod tests {
         metrics.decrement_event_backlog();
         metrics.increment_config_validation_failure();
         metrics.increment_config_reload();
+        metrics.set_cache_circuit_state(1);
+        metrics.record_cache_circuit_transition("closed", "open");
+        metrics.increment_cache_circuit_rejection();
+        metrics.increment_cache_circuit_recovery();
+        metrics.increment_cache_fallback_use();
+        metrics.set_cache_bulkhead_active(3);
+        metrics.increment_cache_bulkhead_rejection();
         metrics.record_webhook_delivery("success", 0.05);
         metrics.record_webhook_delivery("dead_lettered", 1.0);
         metrics.increment_webhook_retry();
@@ -624,6 +737,13 @@ mod tests {
         assert!(output.contains("rate_limit_rejections_total"));
         assert!(output.contains("event_backlog_size"));
         assert!(output.contains("config_validation_failures_total"));
+        assert!(output.contains("cache_circuit_breaker_state"));
+        assert!(output.contains("cache_circuit_breaker_transitions_total"));
+        assert!(output.contains("cache_circuit_breaker_rejections_total"));
+        assert!(output.contains("cache_circuit_breaker_recoveries_total"));
+        assert!(output.contains("cache_fallback_uses_total"));
+        assert!(output.contains("cache_bulkhead_active_operations"));
+        assert!(output.contains("cache_bulkhead_rejections_total"));
         assert!(output.contains("webhook_deliveries_total"));
         assert!(output.contains("webhook_delivery_latency_seconds"));
         assert!(output.contains("webhook_dlq_depth"));

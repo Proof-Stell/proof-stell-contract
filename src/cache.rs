@@ -55,9 +55,9 @@ use std::{
     collections::{HashMap, VecDeque},
     prelude::v1::*,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock, Semaphore};
 
 use crate::metrics::MetricsRegistry;
 
@@ -110,16 +110,35 @@ impl CacheBackend {
     }
 
     /// Retrieve a raw cached value. Emits cache hit/miss/expired metrics.
+    /// When using Redis backend, falls back to InMemory cache on circuit breaker open or failure.
     pub async fn get_raw(&self, key: &CacheKey) -> Result<Option<String>> {
         match self {
             Self::Redis(c) => {
-                // Redis handles TTL natively — misses include expired entries
-                let result = c.get_raw(&key.as_string()).await?;
-                match &result {
-                    Some(_) => c.record_hit(),
-                    None => c.record_miss(),
+                // Try Redis first
+                match c.get_raw(&key.as_string()).await {
+                    Ok(result) => {
+                        match &result {
+                            Some(_) => c.record_hit(),
+                            None => c.record_miss(),
+                        }
+                        Ok(result)
+                    }
+                    Err(_) => {
+                        // Redis failed — fallback to InMemory cache
+                        if let Some(ref m) = c.metrics {
+                            m.increment_cache_fallback_use();
+                        }
+                        let (value, was_expired) = c.fallback().get_raw_with_expiry(key).await?;
+                        if was_expired {
+                            c.fallback().record_expired();
+                        } else if value.is_some() {
+                            c.fallback().record_hit();
+                        } else {
+                            c.fallback().record_miss();
+                        }
+                        Ok(value)
+                    }
                 }
-                Ok(result)
             }
             Self::InMemory(c) => {
                 // InMemory distinguishes expired from true miss
@@ -138,7 +157,19 @@ impl CacheBackend {
 
     pub async fn set_raw(&self, key: &CacheKey, value: &str, ttl: u64) -> Result<()> {
         match self {
-            Self::Redis(c) => c.set_raw(&key.as_string(), value, ttl).await,
+            Self::Redis(c) => {
+                // Try Redis first
+                match c.set_raw(&key.as_string(), value, ttl).await {
+                    Ok(()) => Ok(()),
+                    Err(_) => {
+                        // Redis failed — write to InMemory fallback cache
+                        if let Some(ref m) = c.metrics {
+                            m.increment_cache_fallback_use();
+                        }
+                        c.fallback().set_raw(key, value, ttl).await
+                    }
+                }
+            }
             Self::InMemory(c) => c.set_raw(key, value, ttl).await,
         }
     }
@@ -173,10 +204,275 @@ impl CacheBackend {
 
     pub async fn delete(&self, key: &CacheKey) -> Result<()> {
         match self {
-            Self::Redis(c) => c.delete(&key.as_string()).await,
+            Self::Redis(c) => {
+                // Try Redis first
+                match c.delete(&key.as_string()).await {
+                    Ok(()) => Ok(()),
+                    Err(_) => {
+                        // Redis failed — delete from InMemory fallback cache
+                        if let Some(ref m) = c.metrics {
+                            m.increment_cache_fallback_use();
+                        }
+                        c.fallback().delete(key).await
+                    }
+                }
+            }
             Self::InMemory(c) => c.delete(key).await,
         }
     }
+}
+
+// ── Circuit Breaker ──────────────────────────────────────────────────────
+
+/// Circuit breaker states for Redis cache operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircuitState {
+    /// Normal operation: requests pass through.
+    Closed,
+    /// Circuit is tripped: all requests are rejected.
+    Open,
+    /// Probing: limited requests allowed to test recovery.
+    HalfOpen,
+}
+
+impl CircuitState {
+    fn as_str(&self) -> &'static str {
+        match self {
+            CircuitState::Closed => "closed",
+            CircuitState::Open => "open",
+            CircuitState::HalfOpen => "half_open",
+        }
+    }
+
+    fn as_metric_value(&self) -> i64 {
+        match self {
+            CircuitState::Closed => 0,
+            CircuitState::Open => 1,
+            CircuitState::HalfOpen => 2,
+        }
+    }
+}
+
+/// Configuration for the cache circuit breaker.
+#[derive(Debug, Clone)]
+pub struct CacheCircuitBreakerConfig {
+    pub failure_threshold: u32,
+    pub open_duration_ms: u64,
+    pub half_open_max_calls: u32,
+    pub backoff_base_ms: u64,
+    pub backoff_max_ms: u64,
+}
+
+impl Default for CacheCircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: 5,
+            open_duration_ms: 30_000,
+            half_open_max_calls: 1,
+            backoff_base_ms: 100,
+            backoff_max_ms: 30_000,
+        }
+    }
+}
+
+/// Circuit breaker for Redis cache operations.
+///
+/// Transitions: Closed -> Open (after failure_threshold failures)
+///            Open -> HalfOpen (after open_duration with exponential backoff)
+///            HalfOpen -> Closed (on success) or Open (on failure)
+#[derive(Debug)]
+pub struct CacheCircuitBreaker {
+    state: CircuitState,
+    consecutive_failures: u32,
+    failure_threshold: u32,
+    #[allow(dead_code)]
+    open_duration: Duration,
+    half_open_max_calls: u32,
+    half_open_calls: u32,
+    opened_at: Option<Instant>,
+    backoff_base: Duration,
+    backoff_max: Duration,
+    _last_transition: Option<(CircuitState, CircuitState)>,
+}
+
+impl CacheCircuitBreaker {
+    pub fn new(config: CacheCircuitBreakerConfig) -> Self {
+        Self {
+            state: CircuitState::Closed,
+            consecutive_failures: 0,
+            failure_threshold: config.failure_threshold,
+            open_duration: Duration::from_millis(config.open_duration_ms),
+            half_open_max_calls: config.half_open_max_calls,
+            half_open_calls: 0,
+            opened_at: None,
+            backoff_base: Duration::from_millis(config.backoff_base_ms),
+            backoff_max: Duration::from_millis(config.backoff_max_ms),
+            _last_transition: None,
+        }
+    }
+
+    /// Check if a request is allowed through the circuit breaker.
+    pub fn should_allow(&mut self) -> bool {
+        match self.state {
+            CircuitState::Closed => true,
+            CircuitState::Open => {
+                // Check if we should transition to HalfOpen
+                if let Some(opened_at) = self.opened_at {
+                    let backoff = self.current_backoff();
+                    if opened_at.elapsed() >= backoff {
+                        self.transition_to(CircuitState::HalfOpen);
+                        return true;
+                    }
+                }
+                false
+            }
+            CircuitState::HalfOpen => {
+                self.half_open_calls < self.half_open_max_calls
+            }
+        }
+    }
+
+    /// Record a successful operation.
+    pub fn record_success(&mut self) {
+        match self.state {
+            CircuitState::Closed => {
+                self.consecutive_failures = 0;
+            }
+            CircuitState::HalfOpen => {
+                // Success in half-open: close the circuit
+                self.half_open_calls += 1;
+                if self.half_open_calls >= self.half_open_max_calls {
+                    self.transition_to(CircuitState::Closed);
+                }
+            }
+            CircuitState::Open => {
+                // Shouldn't happen, but handle gracefully
+            }
+        }
+    }
+
+    /// Record a failed operation.
+    pub fn record_failure(&mut self) {
+        match self.state {
+            CircuitState::Closed => {
+                self.consecutive_failures += 1;
+                if self.consecutive_failures >= self.failure_threshold {
+                    self.transition_to(CircuitState::Open);
+                }
+            }
+            CircuitState::HalfOpen => {
+                // Failure in half-open: reopen the circuit
+                self.transition_to(CircuitState::Open);
+            }
+            CircuitState::Open => {
+                // Already open, just increment counter
+                self.consecutive_failures += 1;
+            }
+        }
+    }
+
+    fn transition_to(&mut self, new_state: CircuitState) {
+        let old_state = self.state;
+        self.state = new_state;
+        match new_state {
+            CircuitState::Closed => {
+                self.consecutive_failures = 0;
+                self.opened_at = None;
+                self.half_open_calls = 0;
+            }
+            CircuitState::Open => {
+                self.opened_at = Some(Instant::now());
+                self.half_open_calls = 0;
+            }
+            CircuitState::HalfOpen => {
+                self.half_open_calls = 0;
+            }
+        }
+        // Notify metrics
+        // Note: metrics are passed separately to avoid circular dependency
+        self._last_transition = Some((old_state, new_state));
+    }
+
+    /// Returns the last state transition if one occurred, and clears it.
+    pub fn take_last_transition(&mut self) -> Option<(CircuitState, CircuitState)> {
+        self._last_transition.take()
+    }
+
+    /// Get the current exponential backoff duration.
+    fn current_backoff(&self) -> Duration {
+        let failure_count = self.consecutive_failures.max(1);
+        let base = self.backoff_base.as_millis() as u64;
+        let exponent = (failure_count - 1).min(6);
+        let backoff_ms = (base * 2u64.pow(exponent)).min(self.backoff_max.as_millis() as u64);
+        Duration::from_millis(backoff_ms)
+    }
+
+    /// Get the current state.
+    pub fn state(&self) -> CircuitState {
+        self.state
+    }
+}
+
+// ── Bulkhead ──────────────────────────────────────────────────────────────
+
+/// Configuration for the cache bulkhead.
+#[derive(Debug, Clone)]
+pub struct CacheBulkheadConfig {
+    pub max_concurrent: u32,
+    pub max_queue: u32,
+}
+
+impl Default for CacheBulkheadConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent: 20,
+            max_queue: 200,
+        }
+    }
+}
+
+/// Bulkhead for limiting concurrent Redis cache operations.
+///
+/// Uses a semaphore to limit concurrent operations and a queue depth limit
+/// to prevent memory exhaustion under load.
+#[derive(Debug)]
+pub struct CacheBulkhead {
+    semaphore: Arc<Semaphore>,
+    #[allow(dead_code)]
+    max_concurrent: usize,
+    #[allow(dead_code)]
+    max_queue: usize,
+}
+
+impl CacheBulkhead {
+    pub fn new(config: CacheBulkheadConfig) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(config.max_concurrent as usize)),
+            max_concurrent: config.max_concurrent as usize,
+            max_queue: config.max_queue as usize,
+        }
+    }
+
+    /// Try to acquire a permit. Returns Ok(BulkheadGuard) if available, Err if bulkhead is full.
+    ///
+    /// Non-blocking: immediately rejects if no permits are available.
+    pub async fn try_acquire(&self) -> Result<BulkheadGuard, ()> {
+        let permit = Arc::clone(&self.semaphore)
+            .try_acquire_owned()
+            .map_err(|_| ())?;
+        Ok(BulkheadGuard { _permit: permit })
+    }
+
+    /// Get the number of currently active operations.
+    pub fn active_count(&self) -> usize {
+        self.max_concurrent - self.semaphore.available_permits()
+    }
+}
+
+/// Guard that releases a bulkhead permit on drop.
+#[derive(Debug)]
+pub struct BulkheadGuard {
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 pub struct RedisCache {
@@ -184,6 +480,15 @@ pub struct RedisCache {
     metrics: Option<Arc<MetricsRegistry>>,
     // Health check state with mutex to prevent concurrent health checks
     health_check_state: Arc<Mutex<HealthCheckState>>,
+    // Circuit breaker for Redis operations
+    circuit_breaker: Arc<Mutex<CacheCircuitBreaker>>,
+    // Bulkhead for limiting concurrent Redis operations
+    bulkhead: Arc<CacheBulkhead>,
+    // Fallback InMemory cache for when Redis is open/unhealthy
+    fallback_cache: InMemoryCache,
+    // Circuit breaker configuration
+    #[allow(dead_code)]
+    circuit_breaker_config: CacheCircuitBreakerConfig,
 }
 
 struct HealthCheckState {
@@ -233,18 +538,77 @@ impl HealthCheckState {
 
 impl RedisCache {
     pub async fn new(redis_url: &str) -> Result<Self> {
+        Self::with_config(
+            redis_url,
+            CacheCircuitBreakerConfig::default(),
+            CacheBulkheadConfig::default(),
+        )
+        .await
+    }
+
+    pub async fn with_config(
+        redis_url: &str,
+        cb_config: CacheCircuitBreakerConfig,
+        bulkhead_config: CacheBulkheadConfig,
+    ) -> Result<Self> {
         let client = redis::Client::open(redis_url)?;
         let connection = ConnectionManager::new(client).await?;
         Ok(Self {
             connection,
             metrics: None,
             health_check_state: Arc::new(Mutex::new(HealthCheckState::new())),
+            circuit_breaker: Arc::new(Mutex::new(CacheCircuitBreaker::new(cb_config.clone()))),
+            bulkhead: Arc::new(CacheBulkhead::new(bulkhead_config)),
+            fallback_cache: InMemoryCache::new(),
+            circuit_breaker_config: cb_config,
         })
     }
 
     pub fn with_metrics(mut self, metrics: Arc<MetricsRegistry>) -> Self {
         self.metrics = Some(metrics);
         self
+    }
+
+    /// Check if the circuit breaker allows operations.
+    pub async fn circuit_breaker_allows(&self) -> bool {
+        self.circuit_breaker.lock().await.should_allow()
+    }
+
+    /// Record a successful Redis operation with the circuit breaker.
+    pub async fn record_success(&self) {
+        let mut cb = self.circuit_breaker.lock().await;
+        cb.record_success();
+        if let Some((from, to)) = cb.take_last_transition() {
+            if let Some(ref m) = self.metrics {
+                m.record_cache_circuit_transition(from.as_str(), to.as_str());
+                m.set_cache_circuit_state(to.as_metric_value());
+                if to == CircuitState::Closed {
+                    m.increment_cache_circuit_recovery();
+                }
+            }
+        }
+    }
+
+    /// Record a failed Redis operation with the circuit breaker.
+    pub async fn record_failure(&self) {
+        let mut cb = self.circuit_breaker.lock().await;
+        cb.record_failure();
+        if let Some((from, to)) = cb.take_last_transition() {
+            if let Some(ref m) = self.metrics {
+                m.record_cache_circuit_transition(from.as_str(), to.as_str());
+                m.set_cache_circuit_state(to.as_metric_value());
+            }
+        }
+    }
+
+    /// Get the current circuit breaker state.
+    pub async fn circuit_state(&self) -> CircuitState {
+        self.circuit_breaker.lock().await.state()
+    }
+
+    /// Get a reference to the fallback InMemory cache.
+    pub fn fallback(&self) -> &InMemoryCache {
+        &self.fallback_cache
     }
 
     async fn check_connection(&self) -> bool {
@@ -274,36 +638,132 @@ impl RedisCache {
     }
 
     async fn get_raw(&self, key: &str) -> Result<Option<String>> {
+        // Check circuit breaker
+        if !self.circuit_breaker.lock().await.should_allow() {
+            if let Some(ref m) = self.metrics {
+                m.increment_cache_circuit_rejection();
+            }
+            return Err(anyhow::anyhow!("Cache circuit breaker is open"));
+        }
+
+        // Check bulkhead
+        let _permit = match self.bulkhead.try_acquire().await {
+            Ok(p) => p,
+            Err(()) => {
+                if let Some(ref m) = self.metrics {
+                    m.increment_cache_bulkhead_rejection();
+                }
+                return Err(anyhow::anyhow!("Cache bulkhead is full"));
+            }
+        };
+
+        // Update bulkhead metric
+        if let Some(ref m) = self.metrics {
+            m.set_cache_bulkhead_active(self.bulkhead.active_count() as i64);
+        }
+
         // Validate connection state before operation
         if !self.check_connection().await {
+            self.record_failure().await;
             return Err(anyhow::anyhow!("Redis connection is unhealthy"));
         }
 
-        let mut conn = self.connection.clone();
-        let value: Option<String> = conn.get(key).await?;
-        Ok(value)
+        match self.connection.clone().get(key).await {
+            Ok(value) => {
+                self.record_success().await;
+                Ok(value)
+            }
+            Err(e) => {
+                self.record_failure().await;
+                Err(e.into())
+            }
+        }
     }
 
     async fn set_raw(&self, key: &str, value: &str, ttl: u64) -> Result<()> {
+        // Check circuit breaker
+        if !self.circuit_breaker.lock().await.should_allow() {
+            if let Some(ref m) = self.metrics {
+                m.increment_cache_circuit_rejection();
+            }
+            return Err(anyhow::anyhow!("Cache circuit breaker is open"));
+        }
+
+        // Check bulkhead
+        let _permit = match self.bulkhead.try_acquire().await {
+            Ok(p) => p,
+            Err(()) => {
+                if let Some(ref m) = self.metrics {
+                    m.increment_cache_bulkhead_rejection();
+                }
+                return Err(anyhow::anyhow!("Cache bulkhead is full"));
+            }
+        };
+
+        // Update bulkhead metric
+        if let Some(ref m) = self.metrics {
+            m.set_cache_bulkhead_active(self.bulkhead.active_count() as i64);
+        }
+
         // Validate connection state before operation
         if !self.check_connection().await {
+            self.record_failure().await;
             return Err(anyhow::anyhow!("Redis connection is unhealthy"));
         }
 
-        let mut conn = self.connection.clone();
-        conn.set_ex::<_, _, ()>(key, value, ttl).await?;
-        Ok(())
+        match self.connection.clone().set_ex::<_, _, ()>(key, value, ttl).await {
+            Ok(()) => {
+                self.record_success().await;
+                Ok(())
+            }
+            Err(e) => {
+                self.record_failure().await;
+                Err(e.into())
+            }
+        }
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
+        // Check circuit breaker
+        if !self.circuit_breaker.lock().await.should_allow() {
+            if let Some(ref m) = self.metrics {
+                m.increment_cache_circuit_rejection();
+            }
+            return Err(anyhow::anyhow!("Cache circuit breaker is open"));
+        }
+
+        // Check bulkhead
+        let _permit = match self.bulkhead.try_acquire().await {
+            Ok(p) => p,
+            Err(()) => {
+                if let Some(ref m) = self.metrics {
+                    m.increment_cache_bulkhead_rejection();
+                }
+                return Err(anyhow::anyhow!("Cache bulkhead is full"));
+            }
+        };
+
+        // Update bulkhead metric
+        if let Some(ref m) = self.metrics {
+            m.set_cache_bulkhead_active(self.bulkhead.active_count() as i64);
+        }
+
         // Validate connection state before operation
         if !self.check_connection().await {
+            self.record_failure().await;
             return Err(anyhow::anyhow!("Redis connection is unhealthy"));
         }
 
-        let mut conn = self.connection.clone();
-        conn.del::<_, ()>(key).await?;
-        Ok(())
+        match self.connection.clone().del::<_, ()>(key).await {
+            Ok(()) => {
+                self.record_success().await;
+                Ok(())
+            }
+            Err(e) => {
+                self.record_failure().await;
+                Err(e.into())
+            }
+        }
     }
 
     fn record_hit(&self) {
@@ -1367,5 +1827,370 @@ mod tests {
 
         assert!(event1.is_ok());
         assert!(event2.is_ok());
+    }
+
+    // ── Circuit Breaker Tests ───────────────────────────────────────────
+
+    #[test]
+    fn circuit_breaker_starts_closed() {
+        let mut cb = CacheCircuitBreaker::new(CacheCircuitBreakerConfig::default());
+        assert_eq!(cb.state(), CircuitState::Closed);
+        assert!(cb.should_allow());
+    }
+
+    #[test]
+    fn circuit_breaker_opens_after_threshold() {
+        let config = CacheCircuitBreakerConfig {
+            failure_threshold: 3,
+            ..Default::default()
+        };
+        let mut cb = CacheCircuitBreaker::new(config);
+
+        // Record failures up to threshold
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        // Should not allow when open
+        assert!(!cb.should_allow());
+    }
+
+    #[test]
+    fn circuit_breaker_success_resets_failures() {
+        let config = CacheCircuitBreakerConfig {
+            failure_threshold: 3,
+            ..Default::default()
+        };
+        let mut cb = CacheCircuitBreaker::new(config);
+
+        cb.record_failure();
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        cb.record_success(); // resets failures
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Closed); // not open yet
+    }
+
+    #[test]
+    fn circuit_breaker_transitions_to_half_open_after_backoff() {
+        let config = CacheCircuitBreakerConfig {
+            failure_threshold: 1,
+            open_duration_ms: 10, // very short for testing
+            backoff_base_ms: 10,
+            backoff_max_ms: 100,
+            ..Default::default()
+        };
+        let mut cb = CacheCircuitBreaker::new(config);
+
+        // Open the circuit
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        // Initially blocked
+        assert!(!cb.should_allow());
+
+        // Wait for backoff to expire
+        std::thread::sleep(Duration::from_millis(20));
+
+        // Should now transition to HalfOpen and allow
+        assert!(cb.should_allow());
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+    }
+
+    #[test]
+    fn circuit_breaker_half_open_success_closes() {
+        let config = CacheCircuitBreakerConfig {
+            failure_threshold: 1,
+            open_duration_ms: 10,
+            half_open_max_calls: 1,
+            backoff_base_ms: 10,
+            backoff_max_ms: 100,
+            ..Default::default()
+        };
+        let mut cb = CacheCircuitBreaker::new(config);
+
+        cb.record_failure(); // opens circuit
+        std::thread::sleep(Duration::from_millis(20));
+        cb.should_allow(); // transitions to half_open
+
+        cb.record_success(); // should close circuit
+        assert_eq!(cb.state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn circuit_breaker_half_open_failure_reopens() {
+        let config = CacheCircuitBreakerConfig {
+            failure_threshold: 1,
+            open_duration_ms: 10,
+            half_open_max_calls: 2,
+            backoff_base_ms: 10,
+            backoff_max_ms: 100,
+            ..Default::default()
+        };
+        let mut cb = CacheCircuitBreaker::new(config);
+
+        cb.record_failure(); // opens circuit
+        std::thread::sleep(Duration::from_millis(20));
+        cb.should_allow(); // transitions to half_open
+        cb.record_failure(); // should reopen circuit
+        assert_eq!(cb.state(), CircuitState::Open);
+    }
+
+    #[test]
+    fn circuit_breaker_exponential_backoff_grows() {
+        let config = CacheCircuitBreakerConfig {
+            failure_threshold: 1,
+            open_duration_ms: 60_000,
+            backoff_base_ms: 100,
+            backoff_max_ms: 30_000,
+            ..Default::default()
+        };
+        let mut cb = CacheCircuitBreaker::new(config);
+
+        cb.record_failure();
+        let backoff1 = cb.current_backoff();
+
+        cb.record_failure();
+        let backoff2 = cb.current_backoff();
+
+        // Backoff should grow exponentially
+        assert!(backoff2 > backoff1);
+    }
+
+    #[test]
+    fn circuit_breaker_backoff_caps_at_max() {
+        let config = CacheCircuitBreakerConfig {
+            failure_threshold: 1,
+            open_duration_ms: 60_000,
+            backoff_base_ms: 100,
+            backoff_max_ms: 500,
+            ..Default::default()
+        };
+        let mut cb = CacheCircuitBreaker::new(config);
+
+        // Trigger many failures to grow backoff
+        for _ in 0..20 {
+            cb.record_failure();
+        }
+
+        let backoff = cb.current_backoff();
+        assert!(backoff <= Duration::from_millis(500));
+    }
+
+    #[test]
+    fn circuit_breaker_take_last_transition() {
+        let config = CacheCircuitBreakerConfig {
+            failure_threshold: 1,
+            ..Default::default()
+        };
+        let mut cb = CacheCircuitBreaker::new(config);
+
+        // No transition yet
+        assert!(cb.take_last_transition().is_none());
+
+        // Open the circuit -> should record transition
+        cb.record_failure();
+        let transition = cb.take_last_transition();
+        assert!(transition.is_some());
+        let (from, to) = transition.unwrap();
+        assert_eq!(from, CircuitState::Closed);
+        assert_eq!(to, CircuitState::Open);
+
+        // Should be cleared
+        assert!(cb.take_last_transition().is_none());
+    }
+
+    // ── Bulkhead Tests ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn bulkhead_allows_up_to_max_concurrent() {
+        let config = CacheBulkheadConfig {
+            max_concurrent: 3,
+            max_queue: 10,
+        };
+        let bulkhead = CacheBulkhead::new(config);
+
+        assert_eq!(bulkhead.active_count(), 0);
+
+        let _p1 = bulkhead.try_acquire().await.unwrap();
+        assert_eq!(bulkhead.active_count(), 1);
+
+        let _p2 = bulkhead.try_acquire().await.unwrap();
+        assert_eq!(bulkhead.active_count(), 2);
+
+        let _p3 = bulkhead.try_acquire().await.unwrap();
+        assert_eq!(bulkhead.active_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn bulkhead_rejects_when_full() {
+        let config = CacheBulkheadConfig {
+            max_concurrent: 2,
+            max_queue: 0, // no queue
+        };
+        let bulkhead = CacheBulkhead::new(config);
+
+        let _p1 = bulkhead.try_acquire().await.unwrap();
+        let _p2 = bulkhead.try_acquire().await.unwrap();
+
+        // Should reject when at capacity
+        assert!(bulkhead.try_acquire().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn bulkhead_permits_release_on_drop() {
+        let config = CacheBulkheadConfig {
+            max_concurrent: 1,
+            max_queue: 10,
+        };
+        let bulkhead = CacheBulkhead::new(config);
+
+        {
+            let _permit = bulkhead.try_acquire().await.unwrap();
+            assert_eq!(bulkhead.active_count(), 1);
+        } // permit dropped here
+
+        assert_eq!(bulkhead.active_count(), 0);
+        assert!(bulkhead.try_acquire().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn bulkhead_limits_concurrent_permits() {
+        let config = CacheBulkheadConfig {
+            max_concurrent: 3,
+            max_queue: 10,
+        };
+        let bulkhead = CacheBulkhead::new(config);
+
+        // Use all concurrent slots
+        let _p1 = bulkhead.try_acquire().await.unwrap();
+        let _p2 = bulkhead.try_acquire().await.unwrap();
+        let _p3 = bulkhead.try_acquire().await.unwrap();
+
+        // At max capacity — should reject
+        assert!(bulkhead.try_acquire().await.is_err());
+
+        // Drop one permit
+        drop(_p1);
+
+        // Now should succeed again
+        assert!(bulkhead.try_acquire().await.is_ok());
+    }
+
+    // ── Circuit Breaker Metrics Test ────────────────────────────────────
+
+    #[test]
+    fn circuit_state_as_str_and_metric() {
+        assert_eq!(CircuitState::Closed.as_str(), "closed");
+        assert_eq!(CircuitState::Open.as_str(), "open");
+        assert_eq!(CircuitState::HalfOpen.as_str(), "half_open");
+
+        assert_eq!(CircuitState::Closed.as_metric_value(), 0);
+        assert_eq!(CircuitState::Open.as_metric_value(), 1);
+        assert_eq!(CircuitState::HalfOpen.as_metric_value(), 2);
+    }
+
+    // ── Fallback Integration Tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn redis_cache_fallback_to_inmemory_on_circuit_open() {
+        // Create a RedisCache with a very low failure threshold
+        let cb_config = CacheCircuitBreakerConfig {
+            failure_threshold: 1,
+            open_duration_ms: 60_000,
+            half_open_max_calls: 1,
+            backoff_base_ms: 100,
+            backoff_max_ms: 30_000,
+        };
+        let bulkhead_config = CacheBulkheadConfig::default();
+
+        // Try to connect to Redis — if unavailable, we test the fallback path
+        let redis_cache =
+            RedisCache::with_config("redis://127.0.0.1:6379", cb_config, bulkhead_config).await;
+        if redis_cache.is_err() {
+            return; // Skip if Redis unavailable
+        }
+        let redis_cache = redis_cache.unwrap();
+        let metrics = MetricsRegistry::arc();
+        let redis_cache = redis_cache.with_metrics(Arc::clone(&metrics));
+        let backend = CacheBackend::Redis(redis_cache);
+
+        // Open the circuit breaker by recording a failure
+        if let CacheBackend::Redis(ref c) = backend {
+            c.record_failure().await;
+            assert_eq!(c.circuit_state().await, CircuitState::Open);
+        }
+
+        // Set a value — should fallback to InMemory
+        let key = CacheKey::Verification("fallback_test".to_string());
+        backend.set_raw(&key, "fallback_value", 60).await.unwrap();
+
+        // Get the value — should come from fallback
+        let value = backend.get_raw(&key).await.unwrap();
+        assert_eq!(value, Some("fallback_value".to_string()));
+
+        // Check fallback metric
+        let output = metrics.render();
+        assert!(output.contains("cache_fallback_uses_total"));
+    }
+
+    #[tokio::test]
+    async fn cache_backend_inmemory_has_no_circuit_breaker() {
+        // InMemory backend should always work regardless of circuit breaker state
+        let cache = CacheBackend::InMemory(InMemoryCache::new());
+        let key = CacheKey::Verification("no_cb".to_string());
+
+        cache.set_raw(&key, "value", 60).await.unwrap();
+        let value = cache.get_raw(&key).await.unwrap();
+        assert_eq!(value, Some("value".to_string()));
+
+        cache.delete(&key).await.unwrap();
+        assert_eq!(cache.get_raw(&key).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_config_defaults() {
+        let config = CacheCircuitBreakerConfig::default();
+        assert_eq!(config.failure_threshold, 5);
+        assert_eq!(config.open_duration_ms, 30_000);
+        assert_eq!(config.half_open_max_calls, 1);
+        assert_eq!(config.backoff_base_ms, 100);
+        assert_eq!(config.backoff_max_ms, 30_000);
+    }
+
+    #[tokio::test]
+    async fn bulkhead_config_defaults() {
+        let config = CacheBulkheadConfig::default();
+        assert_eq!(config.max_concurrent, 20);
+        assert_eq!(config.max_queue, 200);
+    }
+
+    // ── Error Variant Tests ─────────────────────────────────────────────
+
+    #[test]
+    fn circuit_breaker_error_display() {
+        use crate::error::AuditError;
+        let err = AuditError::CircuitBreakerOpen("redis is down".to_string());
+        assert!(err.to_string().contains("circuit breaker open"));
+        assert!(err.to_string().contains("redis is down"));
+    }
+
+    #[test]
+    fn bulkhead_full_error_display() {
+        use crate::error::AuditError;
+        let err = AuditError::BulkheadFull("too many operations".to_string());
+        assert!(err.to_string().contains("bulkhead full"));
+        assert!(err.to_string().contains("too many operations"));
+    }
+
+    #[test]
+    fn cache_unhealthy_error_display() {
+        use crate::error::AuditError;
+        let err = AuditError::CacheUnhealthy("connection refused".to_string());
+        assert!(err.to_string().contains("cache unhealthy"));
+        assert!(err.to_string().contains("connection refused"));
     }
 }

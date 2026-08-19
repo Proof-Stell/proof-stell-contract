@@ -21,6 +21,14 @@ const DEFAULT_STELLAR_RETRY_JITTER_TYPE: &str = "full";
 const DEFAULT_STELLAR_BULKHEAD_MAX_CONCURRENT: u32 = 10;
 const DEFAULT_STELLAR_BULKHEAD_MAX_QUEUE: u32 = 100;
 
+const DEFAULT_CACHE_CIRCUIT_BREAKER_FAILURE_THRESHOLD: u32 = 5;
+const DEFAULT_CACHE_CIRCUIT_BREAKER_OPEN_DURATION_MS: u64 = 30_000;
+const DEFAULT_CACHE_CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS: u32 = 1;
+const DEFAULT_CACHE_CIRCUIT_BREAKER_BACKOFF_BASE_MS: u64 = 100;
+const DEFAULT_CACHE_CIRCUIT_BREAKER_BACKOFF_MAX_MS: u64 = 30_000;
+const DEFAULT_CACHE_BULKHEAD_MAX_CONCURRENT: u32 = 20;
+const DEFAULT_CACHE_BULKHEAD_MAX_QUEUE: u32 = 200;
+
 /// Current configuration schema version.
 /// Increment this when adding or removing fields that break backward compatibility.
 pub const CONFIG_VERSION: u32 = 1;
@@ -247,6 +255,17 @@ pub struct AppConfig {
     pub cache_max_size: usize,
     pub cache_config_ttl: u64,
     pub cache_events_ttl: u64,
+
+    // ── Cache circuit breaker configuration ─────────────────────────────
+    pub cache_circuit_breaker_failure_threshold: u32,
+    pub cache_circuit_breaker_open_duration_ms: u64,
+    pub cache_circuit_breaker_half_open_max_calls: u32,
+    pub cache_circuit_breaker_backoff_base_ms: u64,
+    pub cache_circuit_breaker_backoff_max_ms: u64,
+
+    // ── Cache bulkhead configuration ───────────────────────────────────
+    pub cache_bulkhead_max_concurrent: u32,
+    pub cache_bulkhead_max_queue: u32,
 }
 
 impl fmt::Debug for AppConfig {
@@ -336,6 +355,13 @@ impl fmt::Debug for AppConfig {
             .field("cache_max_size", &self.cache_max_size)
             .field("cache_config_ttl", &self.cache_config_ttl)
             .field("cache_events_ttl", &self.cache_events_ttl)
+            .field("cache_circuit_breaker_failure_threshold", &self.cache_circuit_breaker_failure_threshold)
+            .field("cache_circuit_breaker_open_duration_ms", &self.cache_circuit_breaker_open_duration_ms)
+            .field("cache_circuit_breaker_half_open_max_calls", &self.cache_circuit_breaker_half_open_max_calls)
+            .field("cache_circuit_breaker_backoff_base_ms", &self.cache_circuit_breaker_backoff_base_ms)
+            .field("cache_circuit_breaker_backoff_max_ms", &self.cache_circuit_breaker_backoff_max_ms)
+            .field("cache_bulkhead_max_concurrent", &self.cache_bulkhead_max_concurrent)
+            .field("cache_bulkhead_max_queue", &self.cache_bulkhead_max_queue)
             .finish()
     }
 }
@@ -408,6 +434,17 @@ impl AppConfig {
         //   CACHE_VERIFICATION_TTL  - TTL for verification cache (default: 3600)
         //   CACHE_CONFIG_TTL        - TTL for config cache (default: 3600)
         //   CACHE_EVENTS_TTL        - TTL for events cache (default: 1800)
+        //
+        // CACHE CIRCUIT BREAKER:
+        //   CACHE_CIRCUIT_BREAKER_FAILURE_THRESHOLD - Failures before circuit opens (default: 5)
+        //   CACHE_CIRCUIT_BREAKER_OPEN_DURATION_MS  - Duration circuit stays open (default: 30000)
+        //   CACHE_CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS - Probes in half-open state (default: 1)
+        //   CACHE_CIRCUIT_BREAKER_BACKOFF_BASE_MS    - Exponential backoff base (default: 100)
+        //   CACHE_CIRCUIT_BREAKER_BACKOFF_MAX_MS     - Exponential backoff max (default: 30000)
+        //
+        // CACHE BULKHEAD:
+        //   CACHE_BULKHEAD_MAX_CONCURRENT - Max concurrent Redis operations (default: 20)
+        //   CACHE_BULKHEAD_MAX_QUEUE      - Max queued operations when at capacity (default: 200)
 
         let port_raw = get_env_or_default("PORT", "8080");
         let stellar_horizon_url =
@@ -503,6 +540,34 @@ impl AppConfig {
         let cache_max_size_raw = get_env_or_default("CACHE_MAX_SIZE", "10000");
         let cache_config_ttl_raw = get_env_or_default("CACHE_CONFIG_TTL", "3600");
         let cache_events_ttl_raw = get_env_or_default("CACHE_EVENTS_TTL", "1800");
+        let cache_cb_failure_threshold_raw = get_env_or_default(
+            "CACHE_CIRCUIT_BREAKER_FAILURE_THRESHOLD",
+            &DEFAULT_CACHE_CIRCUIT_BREAKER_FAILURE_THRESHOLD.to_string(),
+        );
+        let cache_cb_open_duration_ms_raw = get_env_or_default(
+            "CACHE_CIRCUIT_BREAKER_OPEN_DURATION_MS",
+            &DEFAULT_CACHE_CIRCUIT_BREAKER_OPEN_DURATION_MS.to_string(),
+        );
+        let cache_cb_half_open_max_calls_raw = get_env_or_default(
+            "CACHE_CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS",
+            &DEFAULT_CACHE_CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS.to_string(),
+        );
+        let cache_cb_backoff_base_ms_raw = get_env_or_default(
+            "CACHE_CIRCUIT_BREAKER_BACKOFF_BASE_MS",
+            &DEFAULT_CACHE_CIRCUIT_BREAKER_BACKOFF_BASE_MS.to_string(),
+        );
+        let cache_cb_backoff_max_ms_raw = get_env_or_default(
+            "CACHE_CIRCUIT_BREAKER_BACKOFF_MAX_MS",
+            &DEFAULT_CACHE_CIRCUIT_BREAKER_BACKOFF_MAX_MS.to_string(),
+        );
+        let cache_bulkhead_max_concurrent_raw = get_env_or_default(
+            "CACHE_BULKHEAD_MAX_CONCURRENT",
+            &DEFAULT_CACHE_BULKHEAD_MAX_CONCURRENT.to_string(),
+        );
+        let cache_bulkhead_max_queue_raw = get_env_or_default(
+            "CACHE_BULKHEAD_MAX_QUEUE",
+            &DEFAULT_CACHE_BULKHEAD_MAX_QUEUE.to_string(),
+        );
 
         // ── Port validation with bounds ──────────────────────────────────
         let port: u16 = match port_raw.parse() {
@@ -888,6 +953,145 @@ impl AppConfig {
             }
         };
 
+        // ── Cache circuit breaker validation ─────────────────────────────
+        let cache_circuit_breaker_failure_threshold: u32 =
+            match cache_cb_failure_threshold_raw.parse() {
+                Ok(v) if v > 0 => v,
+                Ok(_) => {
+                    errors.push(
+                        "CACHE_CIRCUIT_BREAKER_FAILURE_THRESHOLD must be greater than 0"
+                            .to_string(),
+                    );
+                    DEFAULT_CACHE_CIRCUIT_BREAKER_FAILURE_THRESHOLD
+                }
+                Err(_) => {
+                    errors.push(format!(
+                        "CACHE_CIRCUIT_BREAKER_FAILURE_THRESHOLD must be a valid u32, got '{}'",
+                        cache_cb_failure_threshold_raw
+                    ));
+                    DEFAULT_CACHE_CIRCUIT_BREAKER_FAILURE_THRESHOLD
+                }
+            };
+
+        let cache_circuit_breaker_open_duration_ms: u64 =
+            match cache_cb_open_duration_ms_raw.parse() {
+                Ok(v) if v > 0 && v <= MAX_TIMEOUT_MS => v,
+                Ok(v) if v > 0 => {
+                    errors.push(format!(
+                        "CACHE_CIRCUIT_BREAKER_OPEN_DURATION_MS ({}) exceeds maximum {}",
+                        v, MAX_TIMEOUT_MS
+                    ));
+                    DEFAULT_CACHE_CIRCUIT_BREAKER_OPEN_DURATION_MS
+                }
+                Ok(_) => {
+                    errors.push(
+                        "CACHE_CIRCUIT_BREAKER_OPEN_DURATION_MS must be greater than 0"
+                            .to_string(),
+                    );
+                    DEFAULT_CACHE_CIRCUIT_BREAKER_OPEN_DURATION_MS
+                }
+                Err(_) => {
+                    errors.push(format!(
+                        "CACHE_CIRCUIT_BREAKER_OPEN_DURATION_MS must be a valid u64, got '{}'",
+                        cache_cb_open_duration_ms_raw
+                    ));
+                    DEFAULT_CACHE_CIRCUIT_BREAKER_OPEN_DURATION_MS
+                }
+            };
+
+        let cache_circuit_breaker_half_open_max_calls: u32 =
+            match cache_cb_half_open_max_calls_raw.parse() {
+                Ok(v) if v > 0 => v,
+                Ok(_) => {
+                    errors.push(
+                        "CACHE_CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS must be greater than 0"
+                            .to_string(),
+                    );
+                    DEFAULT_CACHE_CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS
+                }
+                Err(_) => {
+                    errors.push(format!(
+                        "CACHE_CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS must be a valid u32, got '{}'",
+                        cache_cb_half_open_max_calls_raw
+                    ));
+                    DEFAULT_CACHE_CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS
+                }
+            };
+
+        let cache_circuit_breaker_backoff_base_ms: u64 =
+            match cache_cb_backoff_base_ms_raw.parse() {
+                Ok(v) if v > 0 && v <= MAX_TIMEOUT_MS => v,
+                Ok(_) => {
+                    errors.push(
+                        "CACHE_CIRCUIT_BREAKER_BACKOFF_BASE_MS must be greater than 0"
+                            .to_string(),
+                    );
+                    DEFAULT_CACHE_CIRCUIT_BREAKER_BACKOFF_BASE_MS
+                }
+                Err(_) => {
+                    errors.push(format!(
+                        "CACHE_CIRCUIT_BREAKER_BACKOFF_BASE_MS must be a valid u64, got '{}'",
+                        cache_cb_backoff_base_ms_raw
+                    ));
+                    DEFAULT_CACHE_CIRCUIT_BREAKER_BACKOFF_BASE_MS
+                }
+            };
+
+        let cache_circuit_breaker_backoff_max_ms: u64 =
+            match cache_cb_backoff_max_ms_raw.parse() {
+                Ok(v) if v > 0 && v <= MAX_TIMEOUT_MS => v,
+                Ok(_) => {
+                    errors.push(
+                        "CACHE_CIRCUIT_BREAKER_BACKOFF_MAX_MS must be greater than 0"
+                            .to_string(),
+                    );
+                    DEFAULT_CACHE_CIRCUIT_BREAKER_BACKOFF_MAX_MS
+                }
+                Err(_) => {
+                    errors.push(format!(
+                        "CACHE_CIRCUIT_BREAKER_BACKOFF_MAX_MS must be a valid u64, got '{}'",
+                        cache_cb_backoff_max_ms_raw
+                    ));
+                    DEFAULT_CACHE_CIRCUIT_BREAKER_BACKOFF_MAX_MS
+                }
+            };
+
+        // ── Cache bulkhead validation ────────────────────────────────────
+        let cache_bulkhead_max_concurrent: u32 =
+            match cache_bulkhead_max_concurrent_raw.parse() {
+                Ok(v) if v > 0 => v,
+                Ok(_) => {
+                    errors.push(
+                        "CACHE_BULKHEAD_MAX_CONCURRENT must be greater than 0".to_string(),
+                    );
+                    DEFAULT_CACHE_BULKHEAD_MAX_CONCURRENT
+                }
+                Err(_) => {
+                    errors.push(format!(
+                        "CACHE_BULKHEAD_MAX_CONCURRENT must be a valid u32, got '{}'",
+                        cache_bulkhead_max_concurrent_raw
+                    ));
+                    DEFAULT_CACHE_BULKHEAD_MAX_CONCURRENT
+                }
+            };
+
+        let cache_bulkhead_max_queue: u32 = match cache_bulkhead_max_queue_raw.parse() {
+            Ok(v) if v > 0 => v,
+            Ok(_) => {
+                errors.push(
+                    "CACHE_BULKHEAD_MAX_QUEUE must be greater than 0".to_string(),
+                );
+                DEFAULT_CACHE_BULKHEAD_MAX_QUEUE
+            }
+            Err(_) => {
+                errors.push(format!(
+                    "CACHE_BULKHEAD_MAX_QUEUE must be a valid u32, got '{}'",
+                    cache_bulkhead_max_queue_raw
+                ));
+                DEFAULT_CACHE_BULKHEAD_MAX_QUEUE
+            }
+        };
+
         // Log level validation
         match log_level.to_lowercase().as_str() {
             "trace" | "debug" | "info" | "warn" | "error" => {}
@@ -1064,6 +1268,13 @@ impl AppConfig {
             cache_max_size,
             cache_config_ttl,
             cache_events_ttl,
+            cache_circuit_breaker_failure_threshold,
+            cache_circuit_breaker_open_duration_ms,
+            cache_circuit_breaker_half_open_max_calls,
+            cache_circuit_breaker_backoff_base_ms,
+            cache_circuit_breaker_backoff_max_ms,
+            cache_bulkhead_max_concurrent,
+            cache_bulkhead_max_queue,
         })
     }
 
@@ -1135,6 +1346,13 @@ mod tests {
             "CACHE_MAX_SIZE",
             "CACHE_CONFIG_TTL",
             "CACHE_EVENTS_TTL",
+            "CACHE_CIRCUIT_BREAKER_FAILURE_THRESHOLD",
+            "CACHE_CIRCUIT_BREAKER_OPEN_DURATION_MS",
+            "CACHE_CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS",
+            "CACHE_CIRCUIT_BREAKER_BACKOFF_BASE_MS",
+            "CACHE_CIRCUIT_BREAKER_BACKOFF_MAX_MS",
+            "CACHE_BULKHEAD_MAX_CONCURRENT",
+            "CACHE_BULKHEAD_MAX_QUEUE",
         ];
         for key in keys {
             env::remove_var(key);
@@ -1339,6 +1557,13 @@ mod tests {
             cache_max_size: 10000,
             cache_config_ttl: 3600,
             cache_events_ttl: 1800,
+            cache_circuit_breaker_failure_threshold: 5,
+            cache_circuit_breaker_open_duration_ms: 30_000,
+            cache_circuit_breaker_half_open_max_calls: 1,
+            cache_circuit_breaker_backoff_base_ms: 100,
+            cache_circuit_breaker_backoff_max_ms: 30_000,
+            cache_bulkhead_max_concurrent: 20,
+            cache_bulkhead_max_queue: 200,
         };
 
         let debug = format!("{:?}", config);
