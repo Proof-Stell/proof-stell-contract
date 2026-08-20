@@ -228,6 +228,14 @@ pub struct AppConfig {
     /// Entries older than this TTL are eligible for eviction by the background
     /// cleanup task. Defaults to `3600` (1 hour).
     pub issuer_rate_limit_ttl_seconds: u64,
+    /// Maximum deterministic jitter (seconds) added per issuer to the reported
+    /// bucket reset time.
+    ///
+    /// Spreads issuers' advertised retry/refill instants across a window so that
+    /// a fleet of clients throttled at the same moment does not retry in a
+    /// synchronized thundering herd. The offset is derived deterministically
+    /// from the issuer key (no RNG, no clock drift). Defaults to `0` (disabled).
+    pub per_issuer_rate_limit_jitter_seconds: u64,
 
     pub stellar_max_retries: u32,
     pub stellar_retry_base_delay_ms: u64,
@@ -291,6 +299,10 @@ impl fmt::Debug for AppConfig {
             .field(
                 "issuer_rate_limit_ttl_seconds",
                 &self.issuer_rate_limit_ttl_seconds,
+            )
+            .field(
+                "per_issuer_rate_limit_jitter_seconds",
+                &self.per_issuer_rate_limit_jitter_seconds,
             )
             .field("stellar_max_retries", &self.stellar_max_retries)
             .field(
@@ -496,6 +508,7 @@ impl AppConfig {
         let per_issuer_burst_raw =
             get_env_or_default("PER_ISSUER_RATE_LIMIT_BURST", &per_issuer_burst_default);
         let issuer_ttl_raw = get_env_or_default("ISSUER_RATE_LIMIT_TTL_SECONDS", "3600");
+        let per_issuer_jitter_raw = get_env_or_default("PER_ISSUER_RATE_LIMIT_JITTER_SECONDS", "0");
 
         let stellar_max_retries_raw = get_env_or_default("STELLAR_MAX_RETRIES", "3");
         let stellar_retry_base_delay_ms_raw = get_env_or_default(
@@ -700,6 +713,26 @@ impl AppConfig {
                 3600
             }
         };
+
+        let per_issuer_rate_limit_jitter_seconds: u64 = match per_issuer_jitter_raw.parse() {
+            Ok(v) => v,
+            Err(_) => {
+                errors.push(format!(
+                    "PER_ISSUER_RATE_LIMIT_JITTER_SECONDS must be a valid u64, got '{}'",
+                    per_issuer_jitter_raw
+                ));
+                0
+            }
+        };
+
+        // Jitter must not swamp the TTL window, or advertised reset times could
+        // land beyond an entry's own eviction horizon.
+        if per_issuer_rate_limit_jitter_seconds >= issuer_rate_limit_ttl_seconds {
+            errors.push(format!(
+                "PER_ISSUER_RATE_LIMIT_JITTER_SECONDS ({}) must be < ISSUER_RATE_LIMIT_TTL_SECONDS ({})",
+                per_issuer_rate_limit_jitter_seconds, issuer_rate_limit_ttl_seconds
+            ));
+        }
 
         // ── Parse remaining values with bounds checking ─────────────────
         let stellar_max_retries: u32 = match stellar_max_retries_raw.parse() {
@@ -1244,6 +1277,7 @@ impl AppConfig {
             per_issuer_rate_limit_per_second,
             per_issuer_rate_limit_burst,
             issuer_rate_limit_ttl_seconds,
+            per_issuer_rate_limit_jitter_seconds,
             stellar_max_retries,
             stellar_retry_base_delay_ms,
             stellar_retry_max_delay_ms,
@@ -1533,6 +1567,7 @@ mod tests {
             per_issuer_rate_limit_per_second: 2,
             per_issuer_rate_limit_burst: 4,
             issuer_rate_limit_ttl_seconds: 3600,
+            per_issuer_rate_limit_jitter_seconds: 0,
             stellar_max_retries: 3,
             stellar_retry_base_delay_ms: 100,
             stellar_retry_max_delay_ms: 10_000,

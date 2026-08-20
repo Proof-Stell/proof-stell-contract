@@ -38,6 +38,7 @@ pub struct MetricsRegistry {
 
     // ── Rate limiter metrics (legacy global) ──
     rate_limit_tokens_consumed: IntCounter,
+    rate_limit_tokens_refilled: IntCounter,
     rate_limit_violations: IntCounter,
     rate_limit_resets: IntCounter,
 
@@ -167,6 +168,12 @@ impl MetricsRegistry {
         let rate_limit_tokens_consumed = IntCounter::new(
             "rate_limit_tokens_consumed_total",
             "Total rate limiter tokens consumed (legacy global limiter)",
+        )
+        .unwrap();
+
+        let rate_limit_tokens_refilled = IntCounter::new(
+            "rate_limit_tokens_refilled_total",
+            "Total rate limiter tokens replenished by time-based bucket refill",
         )
         .unwrap();
 
@@ -357,6 +364,7 @@ impl MetricsRegistry {
             Box::new(horizon_latency_seconds.clone()),
             Box::new(retry_total.clone()),
             Box::new(rate_limit_tokens_consumed.clone()),
+            Box::new(rate_limit_tokens_refilled.clone()),
             Box::new(rate_limit_violations.clone()),
             Box::new(rate_limit_resets.clone()),
             Box::new(rate_limit_hits.clone()),
@@ -402,6 +410,7 @@ impl MetricsRegistry {
             horizon_latency_seconds,
             retry_total,
             rate_limit_tokens_consumed,
+            rate_limit_tokens_refilled,
             rate_limit_violations,
             rate_limit_resets,
             rate_limit_hits,
@@ -514,6 +523,13 @@ impl MetricsRegistry {
 
     pub fn record_token_consumed(&self) {
         self.rate_limit_tokens_consumed.inc();
+    }
+
+    /// Record `count` tokens replenished by a time-based bucket refill.
+    pub fn record_tokens_refilled(&self, count: u64) {
+        if count > 0 {
+            self.rate_limit_tokens_refilled.inc_by(count);
+        }
     }
 
     pub fn increment_rate_limit_violation(&self) {
