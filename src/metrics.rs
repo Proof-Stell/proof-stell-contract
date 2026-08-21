@@ -6,6 +6,18 @@ use std::prelude::v1::*;
 use std::sync::Arc;
 use std::time::Instant;
 
+pub trait MetricsBackend: Send + Sync {
+    fn register_counter(&self, name: &str, help: &str) -> Result<(), String>;
+    fn register_gauge(&self, name: &str, help: &str) -> Result<(), String>;
+    fn register_histogram(&self, name: &str, help: &str) -> Result<(), String>;
+    fn counter_inc(&self, name: &str, labels: &[(&str, &str)]) -> Result<(), String>;
+    fn counter_inc_by(&self, name: &str, value: u64, labels: &[(&str, &str)]) -> Result<(), String>;
+    fn gauge_set(&self, name: &str, value: f64, labels: &[(&str, &str)]) -> Result<(), String>;
+    fn gauge_inc(&self, name: &str, labels: &[(&str, &str)]) -> Result<(), String>;
+    fn gauge_dec(&self, name: &str, labels: &[(&str, &str)]) -> Result<(), String>;
+    fn histogram_observe(&self, name: &str, value: f64, labels: &[(&str, &str)]) -> Result<(), String>;
+}
+
 /// Central metrics registry wrapping Prometheus instrumentation.
 ///
 /// This registry is shared across all service modules via `Arc<MetricsRegistry>`
@@ -79,6 +91,10 @@ pub struct MetricsRegistry {
     webhook_delivery_latency_seconds: HistogramVec,
     webhook_dlq_depth: Gauge,
     webhook_retries_total: IntCounter,
+
+    dynamic_counters: std::sync::RwLock<std::collections::HashMap<String, prometheus::IntCounterVec>>,
+    dynamic_gauges: std::sync::RwLock<std::collections::HashMap<String, prometheus::GaugeVec>>,
+    dynamic_histograms: std::sync::RwLock<std::collections::HashMap<String, prometheus::HistogramVec>>,
 }
 
 impl Default for MetricsRegistry {
@@ -434,6 +450,9 @@ impl MetricsRegistry {
             webhook_delivery_latency_seconds,
             webhook_dlq_depth,
             webhook_retries_total,
+            dynamic_counters: std::sync::RwLock::new(std::collections::HashMap::new()),
+            dynamic_gauges: std::sync::RwLock::new(std::collections::HashMap::new()),
+            dynamic_histograms: std::sync::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -696,6 +715,86 @@ impl MetricsRegistry {
     }
 }
 
+impl MetricsBackend for MetricsRegistry {
+    fn register_counter(&self, name: &str, help: &str) -> Result<(), String> {
+        let counter = prometheus::IntCounterVec::new(
+            prometheus::Opts::new(name, help),
+            &["component"],
+        ).map_err(|e| e.to_string())?;
+        self.registry.register(Box::new(counter.clone())).map_err(|e| e.to_string())?;
+        self.dynamic_counters.write().map_err(|e| e.to_string())?.insert(name.to_string(), counter);
+        Ok(())
+    }
+
+    fn register_gauge(&self, name: &str, help: &str) -> Result<(), String> {
+        let gauge = prometheus::GaugeVec::new(
+            prometheus::Opts::new(name, help),
+            &["component"],
+        ).map_err(|e| e.to_string())?;
+        self.registry.register(Box::new(gauge.clone())).map_err(|e| e.to_string())?;
+        self.dynamic_gauges.write().map_err(|e| e.to_string())?.insert(name.to_string(), gauge);
+        Ok(())
+    }
+
+    fn register_histogram(&self, name: &str, help: &str) -> Result<(), String> {
+        let histogram = prometheus::HistogramVec::new(
+            prometheus::HistogramOpts::new(name, help),
+            &["component"],
+        ).map_err(|e| e.to_string())?;
+        self.registry.register(Box::new(histogram.clone())).map_err(|e| e.to_string())?;
+        self.dynamic_histograms.write().map_err(|e| e.to_string())?.insert(name.to_string(), histogram);
+        Ok(())
+    }
+
+    fn counter_inc(&self, name: &str, labels: &[(&str, &str)]) -> Result<(), String> {
+        let counters = self.dynamic_counters.read().map_err(|e| e.to_string())?;
+        let counter = counters.get(name).ok_or_else(|| format!("counter '{}' not found", name))?;
+        let label_values: Vec<&str> = labels.iter().map(|(_, v)| *v).collect();
+        counter.with_label_values(&label_values).inc();
+        Ok(())
+    }
+
+    fn counter_inc_by(&self, name: &str, value: u64, labels: &[(&str, &str)]) -> Result<(), String> {
+        let counters = self.dynamic_counters.read().map_err(|e| e.to_string())?;
+        let counter = counters.get(name).ok_or_else(|| format!("counter '{}' not found", name))?;
+        let label_values: Vec<&str> = labels.iter().map(|(_, v)| *v).collect();
+        counter.with_label_values(&label_values).inc_by(value);
+        Ok(())
+    }
+
+    fn gauge_set(&self, name: &str, value: f64, labels: &[(&str, &str)]) -> Result<(), String> {
+        let gauges = self.dynamic_gauges.read().map_err(|e| e.to_string())?;
+        let gauge = gauges.get(name).ok_or_else(|| format!("gauge '{}' not found", name))?;
+        let label_values: Vec<&str> = labels.iter().map(|(_, v)| *v).collect();
+        gauge.with_label_values(&label_values).set(value);
+        Ok(())
+    }
+
+    fn gauge_inc(&self, name: &str, labels: &[(&str, &str)]) -> Result<(), String> {
+        let gauges = self.dynamic_gauges.read().map_err(|e| e.to_string())?;
+        let gauge = gauges.get(name).ok_or_else(|| format!("gauge '{}' not found", name))?;
+        let label_values: Vec<&str> = labels.iter().map(|(_, v)| *v).collect();
+        gauge.with_label_values(&label_values).inc();
+        Ok(())
+    }
+
+    fn gauge_dec(&self, name: &str, labels: &[(&str, &str)]) -> Result<(), String> {
+        let gauges = self.dynamic_gauges.read().map_err(|e| e.to_string())?;
+        let gauge = gauges.get(name).ok_or_else(|| format!("gauge '{}' not found", name))?;
+        let label_values: Vec<&str> = labels.iter().map(|(_, v)| *v).collect();
+        gauge.with_label_values(&label_values).dec();
+        Ok(())
+    }
+
+    fn histogram_observe(&self, name: &str, value: f64, labels: &[(&str, &str)]) -> Result<(), String> {
+        let histograms = self.dynamic_histograms.read().map_err(|e| e.to_string())?;
+        let histogram = histograms.get(name).ok_or_else(|| format!("histogram '{}' not found", name))?;
+        let label_values: Vec<&str> = labels.iter().map(|(_, v)| *v).collect();
+        histogram.with_label_values(&label_values).observe(value);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -798,5 +897,43 @@ mod tests {
         metrics.increment_request_count();
         let output = metrics.render();
         assert!(output.contains("requests_total"));
+    }
+
+    #[test]
+    fn dynamic_counter_registration_and_increment() {
+        let metrics = MetricsRegistry::new();
+        metrics.register_counter("my_custom_counter", "A test counter").unwrap();
+        metrics.counter_inc("my_custom_counter", &[("component", "test")]).unwrap();
+        metrics.counter_inc_by("my_custom_counter", 5, &[("component", "test")]).unwrap();
+        let output = metrics.render();
+        assert!(output.contains("my_custom_counter"));
+    }
+
+    #[test]
+    fn dynamic_gauge_registration_and_set() {
+        let metrics = MetricsRegistry::new();
+        metrics.register_gauge("my_custom_gauge", "A test gauge").unwrap();
+        metrics.gauge_set("my_custom_gauge", 42.0, &[("component", "test")]).unwrap();
+        metrics.gauge_inc("my_custom_gauge", &[("component", "test")]).unwrap();
+        metrics.gauge_dec("my_custom_gauge", &[("component", "test")]).unwrap();
+        let output = metrics.render();
+        assert!(output.contains("my_custom_gauge"));
+    }
+
+    #[test]
+    fn dynamic_histogram_registration_and_observe() {
+        let metrics = MetricsRegistry::new();
+        metrics.register_histogram("my_custom_histogram", "A test histogram").unwrap();
+        metrics.histogram_observe("my_custom_histogram", 0.5, &[("component", "test")]).unwrap();
+        let output = metrics.render();
+        assert!(output.contains("my_custom_histogram"));
+    }
+
+    #[test]
+    fn dynamic_metric_not_found_returns_error() {
+        let metrics = MetricsRegistry::new();
+        assert!(metrics.counter_inc("nonexistent", &[]).is_err());
+        assert!(metrics.gauge_set("nonexistent", 1.0, &[]).is_err());
+        assert!(metrics.histogram_observe("nonexistent", 1.0, &[]).is_err());
     }
 }
