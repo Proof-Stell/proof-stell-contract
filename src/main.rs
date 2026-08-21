@@ -43,7 +43,7 @@ mod native {
     use serde_json::json;
 
     use proofstell_contract::cache::{CacheBackend, CacheBulkheadConfig, CacheCircuitBreakerConfig, InMemoryCache};
-    use proofstell_contract::config::{self, AppConfig, ConfigUpdate, ConfigWatcher};
+    use proofstell_contract::config::{self, AppConfig, ConfigAuditEntry, ConfigAuditLog, ConfigUpdate, ConfigWatcher};
     use proofstell_contract::metrics::MetricsRegistry;
     use proofstell_contract::webhook::WebhookDispatcher;
 
@@ -55,6 +55,7 @@ mod native {
         cache: Arc<CacheBackend>,
         config_watcher: ConfigWatcher,
         config_version: u32,
+        audit_log: Arc<ConfigAuditLog>,
     }
 
     /// Build the axum router with all application routes.
@@ -68,6 +69,7 @@ mod native {
             .route("/cache/stats", get(cache_stats_handler))
             .route("/config/status", get(config_status_handler))
             .route("/config/reload", post(config_reload_handler))
+            .route("/config/audit", get(config_audit_handler))
             .with_state(state)
     }
 
@@ -91,10 +93,22 @@ mod native {
 
     /// `POST /config/reload` — triggers a config reload from environment variables.
     async fn config_reload_handler(State(state): State<AppState>) -> impl IntoResponse {
+        let old_version = state.config_version;
         match AppConfig::from_env_with_metrics(Some(Arc::clone(&state.metrics))) {
             Ok(new_config) => match ConfigUpdate::new(new_config) {
                 Ok(update) => {
                     if state.config_watcher.send(update).is_ok() {
+                        state.audit_log.record(ConfigAuditEntry {
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| format!("{}", d.as_secs()))
+                                .unwrap_or_default(),
+                            old_version,
+                            new_version: old_version,
+                            actor: "api".to_string(),
+                            success: true,
+                            error: None,
+                        });
                         Json(
                             json!({"status": "ok", "message": "config reload triggered successfully"}),
                         )
@@ -104,10 +118,41 @@ mod native {
                         )
                     }
                 }
-                Err(e) => Json(json!({"status": "error", "message": e.to_string()})),
+                Err(e) => {
+                    state.audit_log.record(ConfigAuditEntry {
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| format!("{}", d.as_secs()))
+                            .unwrap_or_default(),
+                        old_version,
+                        new_version: old_version,
+                        actor: "api".to_string(),
+                        success: false,
+                        error: Some(e.to_string()),
+                    });
+                    Json(json!({"status": "error", "message": e.to_string()}))
+                }
             },
-            Err(e) => Json(json!({"status": "error", "message": e.to_string()})),
+            Err(e) => {
+                state.audit_log.record(ConfigAuditEntry {
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| format!("{}", d.as_secs()))
+                        .unwrap_or_default(),
+                    old_version,
+                    new_version: old_version,
+                    actor: "api".to_string(),
+                    success: false,
+                    error: Some(e.to_string()),
+                });
+                Json(json!({"status": "error", "message": e.to_string()}))
+            }
         }
+    }
+
+    /// `GET /config/audit` — returns the config change audit log.
+    async fn config_audit_handler(State(state): State<AppState>) -> impl IntoResponse {
+        Json(json!({ "entries": state.audit_log.entries() }))
     }
 
     /// `GET /webhooks/dlq` — returns the current DLQ depth.
@@ -263,12 +308,14 @@ mod native {
         });
 
         // ── Router ──────────────────────────────────────────────────
+        let audit_log = Arc::new(ConfigAuditLog::new());
         let state = AppState {
             metrics: Arc::clone(&metrics),
             webhook,
             cache,
             config_watcher,
             config_version: AppConfig::version(),
+            audit_log,
         };
         let app = build_router(state);
 
