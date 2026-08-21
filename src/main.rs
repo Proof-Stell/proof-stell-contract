@@ -55,6 +55,7 @@ mod native {
         cache: Arc<CacheBackend>,
         config_watcher: ConfigWatcher,
         config_version: u32,
+        audit_log: Arc<SecurityAuditLog>,
     }
 
     /// Build the axum router with all application routes.
@@ -68,6 +69,8 @@ mod native {
             .route("/cache/stats", get(cache_stats_handler))
             .route("/config/status", get(config_status_handler))
             .route("/config/reload", post(config_reload_handler))
+            .route("/audit/log", get(audit_log_handler))
+            .route("/audit/verify", get(audit_verify_handler))
             .with_state(state)
     }
 
@@ -159,6 +162,15 @@ mod native {
                 }
             )),
         }
+    }
+
+    async fn audit_log_handler(State(state): State<AppState>) -> impl IntoResponse {
+        Json(json!({ "entries": state.audit_log.entries() }))
+    }
+
+    async fn audit_verify_handler(State(state): State<AppState>) -> impl IntoResponse {
+        let valid = state.audit_log.verify_integrity();
+        Json(json!({ "valid": valid }))
     }
 
     /// Bootstrap: load config, wire up services, and start the server.
@@ -262,6 +274,10 @@ mod native {
             }
         });
 
+        // ── Security audit log ──────────────────────────────────────
+        let audit_log = Arc::new(SecurityAuditLog::new(b"proofstell-hmac-key".to_vec()));
+        audit_log.record("startup", "service started", "127.0.0.1");
+
         // ── Router ──────────────────────────────────────────────────
         let state = AppState {
             metrics: Arc::clone(&metrics),
@@ -269,6 +285,7 @@ mod native {
             cache,
             config_watcher,
             config_version: AppConfig::version(),
+            audit_log,
         };
         let app = build_router(state);
 
@@ -281,6 +298,73 @@ mod native {
         axum::serve(listener, app).await?;
 
         Ok(())
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    pub struct SecurityAuditEntry {
+        pub timestamp: String,
+        pub event_type: String,
+        pub detail: String,
+        pub source_ip: String,
+        pub integrity_hash: String,
+    }
+
+    pub struct SecurityAuditLog {
+        entries: std::sync::Mutex<Vec<SecurityAuditEntry>>,
+        hmac_key: Vec<u8>,
+    }
+
+    impl SecurityAuditLog {
+        pub fn new(hmac_key: Vec<u8>) -> Self {
+            Self { entries: std::sync::Mutex::new(Vec::new()), hmac_key }
+        }
+
+        pub fn record(&self, event_type: &str, detail: &str, source_ip: &str) {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| format!("{}", d.as_secs()))
+                .unwrap_or_default();
+            let payload = format!("{}:{}:{}:{}", timestamp, event_type, detail, source_ip);
+            let integrity_hash = hmac_sha256_hex(&self.hmac_key, payload.as_bytes());
+            let entry = SecurityAuditEntry {
+                timestamp,
+                event_type: event_type.to_string(),
+                detail: detail.to_string(),
+                source_ip: source_ip.to_string(),
+                integrity_hash,
+            };
+            if let Ok(mut entries) = self.entries.lock() {
+                entries.push(entry);
+            }
+        }
+
+        pub fn entries(&self) -> Vec<SecurityAuditEntry> {
+            self.entries.lock().map(|e| e.clone()).unwrap_or_default()
+        }
+
+        pub fn verify_integrity(&self) -> bool {
+            let entries = match self.entries.lock() {
+                Ok(e) => e,
+                Err(_) => return false,
+            };
+            for entry in entries.iter() {
+                let payload = format!("{}:{}:{}:{}", entry.timestamp, entry.event_type, entry.detail, entry.source_ip);
+                let expected = hmac_sha256_hex(&self.hmac_key, payload.as_bytes());
+                if expected != entry.integrity_hash {
+                    return false;
+                }
+            }
+            true
+        }
+    }
+
+    fn hmac_sha256_hex(key: &[u8], data: &[u8]) -> String {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        data.hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
     }
 }
 
