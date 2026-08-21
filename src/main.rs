@@ -37,6 +37,7 @@ mod native {
     use std::sync::Arc;
 
     use axum::extract::State;
+    use axum::http::StatusCode;
     use axum::response::IntoResponse;
     use axum::routing::{get, post};
     use axum::{Json, Router};
@@ -55,6 +56,7 @@ mod native {
         cache: Arc<CacheBackend>,
         config_watcher: ConfigWatcher,
         config_version: u32,
+        shutdown_flag: Arc<tokio::sync::RwLock<bool>>,
     }
 
     /// Build the axum router with all application routes.
@@ -72,8 +74,14 @@ mod native {
     }
 
     /// `GET /health` — returns a JSON health-check payload.
-    async fn health_handler() -> impl IntoResponse {
-        Json(json!({"status": "ok"}))
+    async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
+        if *state.shutdown_flag.read().await {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"status": "shutting_down"})),
+            );
+        }
+        (StatusCode::OK, Json(json!({"status": "ok"})))
     }
 
     /// `GET /metrics` — returns Prometheus text-format metrics.
@@ -159,6 +167,36 @@ mod native {
                 }
             )),
         }
+    }
+
+    /// Listen for SIGTERM / SIGINT, then flip the shutdown flag so the
+    /// health endpoint reports 503 while `axum::serve` drains in-flight
+    /// connections.
+    async fn shutdown_signal(flag: Arc<tokio::sync::RwLock<bool>>) {
+        let ctrl_c = async {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("failed to install Ctrl+C handler");
+        };
+
+        #[cfg(unix)]
+        let terminate = async {
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install signal handler")
+                .recv()
+                .await;
+        };
+
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = terminate => {},
+        }
+
+        *flag.write().await = true;
+        eprintln!("[proofstell] Shutdown signal received, starting graceful shutdown...");
     }
 
     /// Bootstrap: load config, wire up services, and start the server.
@@ -263,12 +301,16 @@ mod native {
         });
 
         // ── Router ──────────────────────────────────────────────────
+        let shutdown_flag = Arc::new(tokio::sync::RwLock::new(false));
+        let webhook_for_shutdown = Arc::clone(&webhook);
+        let cache_for_shutdown = Arc::clone(&cache);
         let state = AppState {
             metrics: Arc::clone(&metrics),
             webhook,
             cache,
             config_watcher,
             config_version: AppConfig::version(),
+            shutdown_flag: Arc::clone(&shutdown_flag),
         };
         let app = build_router(state);
 
@@ -278,7 +320,15 @@ mod native {
         eprintln!("[proofstell] Config endpoints: GET /config/status, POST /config/reload");
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, app).await?;
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal(shutdown_flag))
+            .await?;
+
+        eprintln!("[proofstell] Draining webhook DLQ...");
+        webhook_for_shutdown.drain_dlq().await;
+        eprintln!("[proofstell] Flushing cache...");
+        drop(cache_for_shutdown);
+        eprintln!("[proofstell] Shutdown complete");
 
         Ok(())
     }
