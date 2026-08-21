@@ -1336,6 +1336,50 @@ impl AppConfig {
         }
         Ok(())
     }
+
+    pub async fn validate_connectivity(&self) -> Result<(), String> {
+        let url = format!("{}/{}", self.stellar_horizon_url.trim_end_matches('/'), "health");
+        match reqwest::Client::new()
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => Ok(()),
+            Ok(resp) => Err(format!("Horizon returned status {}", resp.status())),
+            Err(e) => Err(format!("Horizon unreachable: {}", e)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ConfigAuditEntry {
+    pub timestamp: String,
+    pub old_version: u32,
+    pub new_version: u32,
+    pub actor: String,
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+pub struct ConfigAuditLog {
+    entries: std::sync::Mutex<Vec<ConfigAuditEntry>>,
+}
+
+impl ConfigAuditLog {
+    pub fn new() -> Self {
+        Self { entries: std::sync::Mutex::new(Vec::new()) }
+    }
+
+    pub fn record(&self, entry: ConfigAuditEntry) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.push(entry);
+        }
+    }
+
+    pub fn entries(&self) -> Vec<ConfigAuditEntry> {
+        self.entries.lock().map(|e| e.clone()).unwrap_or_default()
+    }
 }
 
 #[cfg(test)]
@@ -1779,5 +1823,27 @@ mod tests {
     #[test]
     fn config_version_constant_is_consistent() {
         assert_eq!(CONFIG_VERSION, 1);
+    }
+
+    #[test]
+    fn config_audit_log_records_entries() {
+        let log = ConfigAuditLog::new();
+        log.record(ConfigAuditEntry {
+            timestamp: "2025-01-01T00:00:00Z".to_string(),
+            old_version: 1,
+            new_version: 2,
+            actor: "admin".to_string(),
+            success: true,
+            error: None,
+        });
+        let entries = log.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].new_version, 2);
+    }
+
+    #[test]
+    fn config_audit_log_starts_empty() {
+        let log = ConfigAuditLog::new();
+        assert!(log.entries().is_empty());
     }
 }
